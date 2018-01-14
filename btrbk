@@ -3882,7 +3882,7 @@ sub format_preserve_matrix($@)
     else {
       push @out, "latest" if($preserve->{min_q} && ($preserve->{min_q} eq 'latest'));
       push @out, "all within $preserve->{min_n} $trans{$preserve->{min_q}}" if($preserve->{min_n} && $preserve->{min_q});
-      push @out, "first of day (starting at $preserve->{hod} o'clock) for $preserve->{d} days" if($preserve->{d});
+      push @out, "first of day (starting at " . sprintf("%02u:00", $preserve->{hod}) . ") for $preserve->{d} days" if($preserve->{d});
       unless($preserve->{d} && ($preserve->{d} eq 'all')) {
         push @out, "first daily in week (starting on $preserve->{dow}) for $preserve->{w} weeks" if($preserve->{w});
         unless($preserve->{w} && ($preserve->{w} eq 'all')) {
@@ -3909,10 +3909,8 @@ sub format_preserve_matrix($@)
       $val = '*' if($val eq 'all');
       $s .= ($s ? ' ' : '') . $val . $_;
     }
-    my $t = "";
-    $t .= "$preserve->{dow}" if($preserve->{dow} && ($preserve->{w} || $preserve->{m} || $preserve->{y}));
-    $t .= ((($t eq "") ? "" : " ") . "at $preserve->{hod}") if($preserve->{hod} && ($preserve->{d} || $preserve->{w} || $preserve->{m} || $preserve->{y}));
-    $s .= ($t eq "") ? "" : " ($t)";
+    $s .= sprintf(" ^%02u:00", $preserve->{hod}) if($preserve->{hod} && ($preserve->{d} || $preserve->{w} || $preserve->{m} || $preserve->{y}));
+    $s .= " ^" . $preserve->{dow} if($preserve->{dow} && ($preserve->{w} || $preserve->{m} || $preserve->{y}));
   }
   return $s;
 }
