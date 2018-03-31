@@ -1549,8 +1549,7 @@ sub system_verify_raw
 {
   my $target = shift // die;
   my $file_path = shift // die;
-  my $type = shift // die;
-  my $source_digest_pipe = shift // die;
+  my $mode = shift // die;
 
   my $file_size = run_cmd(cmd => [ 'stat', '-c"%s"', { unsafe => $file_path } ],
                           rsh => vinfo_rsh($target),
@@ -1560,12 +1559,13 @@ sub system_verify_raw
     ERROR "Failed to read size of raw file";
     return undef;
   }
+  $file_size = Math::BigInt->new($file_size);
   DEBUG "Total size (bytes, to end of file): $file_size";
-  return 0 unless($file_size > 0);
+  return { file_size => 0 } unless($file_size > 0);
 
-  my ($target_cmd, $source_cmd);
+  my ($samples, $target_cmd, $source_cmd);
 
-  if($type eq 'sample') {
+  if($mode eq 'sample') {
     my $minsamples = config_key($target, "verify_sample_minsamples");
     my $maxsamples = config_key($target, "verify_sample_maxsamples");
     my $minsize = floor(humansize_to_bytes(config_key($target, "verify_sample_minsize")));
@@ -1584,7 +1584,7 @@ sub system_verify_raw
       return undef;
     }
     DEBUG "verify-sample: min=$minsamples max=$maxsamples minsz=$minsize maxsz=$maxsize div=$divisor";
-    my $samples = _calc_verify_samples($file_size, $divisor, $minsamples, $maxsamples, $minsize, $maxsize);
+    $samples = _calc_verify_samples($file_size, $divisor, $minsamples, $maxsamples, $minsize, $maxsize);
 
     if(defined $samples) {
       $target_cmd = [ qw/ { for i in /, @{$samples->{absolute}}, qw/ ; do dd status=none bs=1M /,
@@ -1597,11 +1597,11 @@ sub system_verify_raw
     }
     else {
       # minsamples * minsize < filesize, fallback to full verification
-      $type = 'full';
+      $mode = 'full';
     }
   }
 
-  if($type eq 'full') {
+  if($mode eq 'full') {
     DEBUG "verify-full";
     $target_cmd = [ qw/ dd status=none bs=1M /, "if='${file_path}'" ];
     $source_cmd = [ qw/ ( verify="$( dd status=none bs=1M /, 'iflag=fullblock,count_bytes', "count=$file_size" ];
@@ -1618,13 +1618,14 @@ sub system_verify_raw
   return undef unless(defined($target_digest));
   ($target_digest) = split(/\s/, $target_digest);
   unless($target_digest =~ /^[0-9A-f]{$digest_hexlen}$/) {
-    ABORTED($target, "Failed to digest partial file: $file_path");
+    ABORTED($target, "Failed to digest file: $file_path");
     return undef;
   }
   DEBUG "Target digest: $target_digest (sha256)";
 
-  push @{$source_digest_pipe}, {
-      cmd => [ @{$source_cmd}, qw/ | sha256sum -b - | cut /, "-d' '", qw/ -f1 )" ; [ "${verify}" != /, "'$target_digest'",
+  $source_cmd = {
+      cmd => [ @{$source_cmd},
+               qw/ | sha256sum -b - | cut /, "-d' '", qw/ -f1 )" ; [ "${verify}" != /, "'$target_digest'",
                qw/ ] && >&2 echo "--VERIFICATION-FAILURE--:${verify}" && exit 3 ; dd status=none bs=1M ) /
              ],
       compressed_ok => 1,
@@ -1632,7 +1633,7 @@ sub system_verify_raw
   };
   #TRACE(Data::Dumper->Dump([$source_digest_pipe], ["pipe"])) if($do_dumper);
 
-  return $file_size;
+  return { file_size => $file_size, samples => $samples, source_cmd => $source_cmd };
 }
 
 sub btrfs_send_to_file($$$;$$)
@@ -1843,17 +1844,22 @@ sub btrfs_send_to_file($$$;$$)
 
   my $target_seek_bytes = 0;
   if ($do_resume) {
-    $target_seek_bytes = system_verify_raw(
+    my $verify = system_verify_raw(
         $target,
         $incomplete_vol->{FILE_PATH},
-        (config_key($target, 'raw_target_resume') eq 'verify-sample') ? 'sample' : 'full',
-        \@cmd_pipe
+        (config_key($target, 'raw_target_resume') eq 'verify-sample') ? 'sample' : 'full'
     );
-    unless($target_seek_bytes > 0) {
-      WARN "Incomplete file appears to be empty, canceling resume";
-      WARN "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+    unless(defined $verify) {
+      ERROR "Failed to digest incomplete file: $vol_received->{PRINT}";
       die;
     }
+    unless($verify->{file_size} > 0) {
+      ERROR "Incomplete file appears to be empty, canceling resume";
+      ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+      die;
+    }
+    push @cmd_pipe, $verify->{source_cmd};
+    $target_seek_bytes = $verify->{file_size};
   }
 
   if($split) {
