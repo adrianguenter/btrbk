@@ -32,7 +32,6 @@ use Carp qw(confess);
 use Getopt::Long qw(GetOptions);
 use Time::Local qw( timelocal timegm timegm_nocheck );
 use POSIX qw(floor);
-use Storable qw(dclone);
 use Math::BigFloat try => 'GMP';
 use Math::BigInt try => 'GMP';
 
