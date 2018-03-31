@@ -31,6 +31,10 @@ use warnings FATAL => qw( all ), NONFATAL => qw( deprecated );
 use Carp qw(confess);
 use Getopt::Long qw(GetOptions);
 use Time::Local qw( timelocal timegm timegm_nocheck );
+use POSIX qw(floor);
+use Storable qw(dclone);
+use Math::BigFloat try => 'GMP';
+use Math::BigInt try => 'GMP';
 
 our $VERSION         = '0.27.0-dev';
 our $AUTHOR          = 'Axel Burri <axel@tty0.ch>';
@@ -66,6 +70,9 @@ my $raw_postfix_match = qr/\.btrfs(\.($compress_format_alt))?(\.(gpg|encrypted))
 
 my $group_match = qr/[a-zA-Z0-9_:-]+/;
 my $ssh_cipher_match = qr/[a-z0-9][a-z0-9@.-]+/;
+
+my $humansize_prefixes = 'KMGTPEZY';
+my $humansize_match = qr/^([0-9]+(?:\.[0-9]+)?)\s*(?:B|([${humansize_prefixes}])(iB?|B)?)?$/;
 
 my %day_of_week_map = ( sunday => 0, monday => 1, tuesday => 2, wednesday => 3, thursday => 4, friday => 5, saturday => 6 );
 my @syslog_facilities = qw( user mail daemon auth lpr news cron authpriv local0 local1 local2 local3 local4 local5 local6 local7 );
@@ -107,6 +114,15 @@ my %config_options = (
   raw_target_compress_level   => { default => "default", accept => [ "default" ], accept_numeric => 1 },
   raw_target_compress_threads => { default => "default", accept => [ "default" ], accept_numeric => 1 },
   raw_target_encrypt          => { default => undef,     accept => [ "no", "gpg", "openssl_enc" ] },
+  raw_target_resume           => { default => undef,     accept => [ "no", "verify-full", "verify-sample" ] },
+
+  verify_digest_algorithm     => { default => "sha256",  accept => [ "sha256" ] }, # NOTE: sha256sum is hard-coded for now
+  verify_sample_minsamples    => { default => "3",       accept_numeric => 1 },
+  verify_sample_maxsamples    => { default => "7",       accept_numeric => 1 },
+  verify_sample_minsize       => { default => "32K",     accept_regexp => $humansize_match },
+  verify_sample_maxsize       => { default => "512M",    accept_regexp => $humansize_match },
+  verify_sample_divisor       => { default => "32",      accept_numeric => 1 },
+
   raw_target_block_size       => { default => "128K",    accept_regexp => qr/^[0-9]+(kB|k|K|KiB|MB|M|MiB)?$/ },
   raw_target_split            => { default => undef,     accept => [ "no" ], accept_regexp => qr/^[0-9]+([kmgtpezyKMGTPEZY][bB]?)?$/ },
   gpg_keyring                 => { default => undef,     accept_file => { absolute => 1 } },
@@ -491,6 +507,17 @@ sub end_transaction($$)
     action($type, %$_, status => $status, time => $time, duration => ($dryrun ? undef : ($time - $_->{time})));
   }
   $current_transaction = undef;
+}
+
+sub humansize_to_bytes($)
+{
+  my $humansize = shift // die;
+  return undef unless($humansize =~ $humansize_match);
+  my $quantity = Math::BigFloat->new($1);
+  return $quantity unless(defined $2); # Input is in bytes
+  my $base = (defined($3) && $3 eq 'B') ? 1000 : 1024;
+  my $power = Math::BigInt->new(index($humansize_prefixes, $2) + 1);
+  return $quantity * $base**$power;
 }
 
 sub syslog($)
@@ -1458,6 +1485,156 @@ sub btrfs_send_receive($$$$)
   return 1;
 }
 
+sub _calc_verify_samples
+{
+  my $file_size = shift // die;
+  my $divisor = shift // die;
+  my $minsamples = shift // die;
+  my $maxsamples = shift // die;
+  my $minsize = shift // die;
+  my $maxsize = shift // die;
+
+  my $sample_size = floor($file_size / $divisor);
+  if($sample_size < $minsize) {
+    $sample_size = $minsize;
+  }
+  elsif($sample_size > $maxsize) {
+    $sample_size = $maxsize;
+  }
+  DEBUG "Sample size: $sample_size";
+
+  my $file_samples = floor($file_size / $sample_size); # total samples in the file
+  DEBUG "Total samples: $file_samples";
+
+  return undef unless($file_samples >= $minsamples);
+
+  my $sample_count = ($maxsamples < $file_samples) ? $maxsamples : $file_samples;
+  DEBUG "Samples: $sample_count";
+
+  my $region_size = floor($file_size / $sample_count);
+  DEBUG "Region size: $region_size";
+
+  my $region_offset_size = 0;
+  if($region_size > $sample_size) {
+    $region_offset_size = floor(($region_size - $sample_size) / 2);
+  }
+  DEBUG "Region offset: $region_offset_size";
+
+  my $sample_loc;
+  my @start_list;
+  my @offset_start_list;
+  my $fileptr = 0;
+  for(my $i = 0; $i < $sample_count; $i++){
+    if($i == ($sample_count - 1)) {
+      # Last (mandatory) sample
+      $sample_loc = $file_size - $sample_size;
+    }
+    elsif($i == 0) {
+      # First sample
+      $sample_loc = 0;
+    }
+    else {
+      $sample_loc = ($i * $region_size) + $region_offset_size;
+    }
+    push @start_list, $sample_loc;
+    push @offset_start_list, $sample_loc - $fileptr;
+    $fileptr = $sample_loc + $sample_size;
+  }
+
+  DEBUG "Samples: @start_list";
+  DEBUG "Samples (offsets): @offset_start_list";
+  return { size => $sample_size, count => $sample_count, absolute => \@start_list, offset => \@offset_start_list };
+}
+
+sub system_verify_raw
+{
+  my $target = shift // die;
+  my $file_path = shift // die;
+  my $type = shift // die;
+  my $source_digest_pipe = shift // die;
+
+  my $file_size = run_cmd(cmd => [ 'stat', '-c"%s"', { unsafe => $file_path } ],
+                          rsh => vinfo_rsh($target),
+                          non_destructive => 1
+                         );
+  unless(defined($file_size)) {
+    ERROR "Failed to read size of raw file";
+    return undef;
+  }
+  DEBUG "Total size (bytes, to end of file): $file_size";
+  return 0 unless($file_size > 0);
+
+  my ($target_cmd, $source_cmd);
+
+  if($type eq 'sample') {
+    my $minsamples = config_key($target, "verify_sample_minsamples");
+    my $maxsamples = config_key($target, "verify_sample_maxsamples");
+    my $minsize = floor(humansize_to_bytes(config_key($target, "verify_sample_minsize")));
+    my $maxsize = floor(humansize_to_bytes(config_key($target, "verify_sample_maxsize")));
+    my $divisor   = config_key($target, "verify_sample_divisor");
+    if($minsamples > $maxsamples) {
+      ERROR "verify_sample_minsamples must be less than or equal to verify_sample_maxsamples";
+      return undef;
+    }
+    if($minsize > $maxsize) {
+      ERROR "verify_sample_minsize must be less than or equal to verify_sample_maxsize";
+      return undef;
+    }
+    if($divisor < $minsamples) {
+      ERROR "verify_sample_divisor must be greater than or equal to verify_sample_minsamples";
+      return undef;
+    }
+    DEBUG "verify-sample: min=$minsamples max=$maxsamples minsz=$minsize maxsz=$maxsize div=$divisor";
+    my $samples = _calc_verify_samples($file_size, $divisor, $minsamples, $maxsamples, $minsize, $maxsize);
+
+    if(defined $samples) {
+      $target_cmd = [ qw/ { for i in /, @{$samples->{absolute}}, qw/ ; do dd status=none bs=1M /,
+                      'iflag=count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
+                      "if='${file_path}'", qw/ ; done } / ];
+
+      $source_cmd = [ qw/ ( verify="$( { for i in /, @{$samples->{offset}}, qw/ ; do dd status=none bs=1M /,
+                      'iflag=fullblock,count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
+                      qw/ ; done } / ];
+    }
+    else {
+      # minsamples * minsize < filesize, fallback to full verification
+      $type = 'full';
+    }
+  }
+
+  if($type eq 'full') {
+    DEBUG "verify-full";
+    $target_cmd = [ qw/ dd status=none bs=1M /, "if='${file_path}'" ];
+    $source_cmd = [ qw/ ( verify="$( dd status=none bs=1M /, 'iflag=fullblock,count_bytes', "count=$file_size" ];
+  }
+
+  my $digest_bitlen = 256;
+  my $digest_hexlen = $digest_bitlen / 4;
+  my $target_digest = run_cmd(
+    cmd => [ @{$target_cmd}, qw/ | sha256sum -b - / ],
+    check_unsafe => [ { unsafe => $file_path } ],
+    rsh => vinfo_rsh($target),
+    non_destructive => 1,
+  );
+  return undef unless(defined($target_digest));
+  ($target_digest) = split(/\s/, $target_digest);
+  unless($target_digest =~ /^[0-9A-f]{$digest_hexlen}$/) {
+    ABORTED($target, "Failed to digest partial file: $file_path");
+    return undef;
+  }
+  DEBUG "Target digest: $target_digest (sha256)";
+
+  push @{$source_digest_pipe}, {
+      cmd => [ @{$source_cmd}, qw/ | sha256sum -b - | cut /, "-d' '", qw/ -f1 )" ; [ "${verify}" != /, "'$target_digest'",
+               qw/ ] && >&2 echo "--VERIFICATION-FAILURE--:${verify}" && exit 3 ; dd status=none bs=1M ) /
+             ],
+      compressed_ok => 1,
+      catch_stderr => 1, # hack for shell-based run_cmd()
+  };
+  #TRACE(Data::Dumper->Dump([$source_digest_pipe], ["pipe"])) if($do_dumper);
+
+  return $file_size;
+}
 
 sub btrfs_send_to_file($$$;$$)
 {
@@ -1517,6 +1694,19 @@ sub btrfs_send_to_file($$$;$$)
   my $vol_received = vinfo_child($target, $target_filename);
   $$ret_vol_received = $vol_received if(ref $ret_vol_received);
 
+  my $do_resume = defined(config_key($target, "raw_target_resume"));
+  my $incomplete_vol = vinfo_subvol($target, $target_filename);
+  $do_resume = 0 unless(ref($incomplete_vol) &&
+                        $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} &&
+                        $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} == 1
+                       );
+
+  if ($do_resume) {
+    $incomplete_vol->{node}->{BTRBK_RAW}->{FILE_PATH} = $incomplete_vol->{PATH};
+    $incomplete_vol = $incomplete_vol->{node}->{BTRBK_RAW};
+    INFO "Incomplete raw target backup found: $incomplete_vol->{FILE_PATH}; Attempting to resume";
+  }
+
   if($encrypt) {
     $raw_info{encrypt} = $encrypt->{type};
 
@@ -1531,6 +1721,10 @@ sub btrfs_send_to_file($$$;$$)
       #   generation faster; however sometimes write operations are not
       #   desired. This option can be used to achieve that with the cost
       #   of slower random generation.
+
+      # NOTE: gpg can't be resumed as it doesn't generate reproducable output
+      $do_resume = 0;
+
       my @gpg_options = ( '--batch', '--no-tty', '--no-random-seed-file', '--trust-model', 'always' );
       push @gpg_options, ( '--compress-algo', 'none' ) if($compress);  # NOTE: if --compress-algo is not set, gpg might still compress according to OpenPGP standard.
       push(@gpg_options, ( '--no-default-keyring', '--keyring', $encrypt->{keyring} )) if($encrypt->{keyring});
@@ -1544,18 +1738,37 @@ sub btrfs_send_to_file($$$;$$)
     elsif($encrypt->{type} eq "openssl_enc") {
       # encrypt using "openssl enc"
       $raw_info{cipher} = $encrypt->{ciphername};
-
-      # NOTE: iv is always generated locally!
       my $iv_size = $encrypt->{iv_size};
       my $iv;
-      if($iv_size) {
-        INFO "Generating iv for openssl encryption (cipher=$encrypt->{ciphername})";
-        $iv = system_urandom($iv_size, 'hex');
-        unless($iv) {
-          ERROR "Failed generate IV for openssl_enc: $source->{PRINT}";
-          return undef;
+
+      if($do_resume) {
+        my $incomplete_iv_size = length($incomplete_vol->{iv}) / 2;
+        if($encrypt->{ciphername} ne $incomplete_vol->{cipher}) {
+          WARN "Cipher has changed in target configuration, canceling resume";
+          $do_resume = 0;
         }
-        $raw_info{iv} = $iv;
+        elsif($iv_size != $incomplete_iv_size) {
+          WARN "IV size has changed in target configuration, canceling resume";
+          $do_resume = 0;
+        }
+        else {
+          DEBUG "Resume using cipher '$incomplete_vol->{cipher}' and IV '$incomplete_vol->{iv}'";
+          $iv = $incomplete_vol->{iv};
+          $raw_info{iv} = $iv;
+        }
+      }
+
+      unless($do_resume) {
+        # NOTE: iv is always generated locally!
+        if($iv_size) {
+          INFO "Generating iv for openssl encryption (cipher=$encrypt->{ciphername})";
+          $iv = system_urandom($iv_size, 'hex');
+          unless($iv) {
+            ERROR "Failed generate IV for openssl_enc: $source->{PRINT}";
+            return undef;
+          }
+          $raw_info{iv} = $iv;
+        }
       }
 
       my $encrypt_key;
@@ -1629,7 +1842,24 @@ sub btrfs_send_to_file($$$;$$)
     }
   }
 
+  my $target_seek_bytes = 0;
+  if ($do_resume) {
+    $target_seek_bytes = system_verify_raw(
+        $target,
+        $incomplete_vol->{FILE_PATH},
+        (config_key($target, 'raw_target_resume') eq 'verify-sample') ? 'sample' : 'full',
+        \@cmd_pipe
+    );
+    unless($target_seek_bytes > 0) {
+      WARN "Incomplete file appears to be empty, canceling resume";
+      WARN "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+      die;
+    }
+  }
+
   if($split) {
+    $do_resume = 0; # TODO: Implement?
+
     # NOTE: we do not append a ".split" suffix on $target_filename here, as this propagates to ".info" file
     $raw_info{split} = $split;
     push @cmd_pipe, {
@@ -1652,7 +1882,9 @@ sub btrfs_send_to_file($$$;$$)
       # Another approach would be to always pipe through "cat", which
       # uses st_blksize from fstat(2) (with a minimum of 128K) to
       # determine the block size.
-      cmd => [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"), "of=${target_path}/${target_filename}" ],
+      cmd => [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"),
+               'oflag=seek_bytes' , "seek=${target_seek_bytes}", "of=${target_path}/${target_filename}"
+             ],
       check_unsafe => [ { unsafe => "${target_path}/${target_filename}" } ],
       #redirect_to_file => { unsafe => "${target_path}/${target_filename}" },  # alternative (use shell redirection), less overhead on local filesystems (barely measurable):
       rsh => vinfo_rsh($target, disable_compression => $compress || config_compress_hash($target, "stream_compress")),
@@ -1685,6 +1917,15 @@ sub btrfs_send_to_file($$$;$$)
 
   if(defined($ret)) {
     $ret = run_cmd(@cmd_pipe);
+  }
+
+  if ($do_resume) {
+    if ($ret =~ /--VERIFICATION-FAILURE--/) {
+      # TODO: Auto-retry
+      ERROR "Incomplete file digest verification failed";
+      ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+      die;
+    }
   }
 
   if(defined($ret)) {
@@ -1920,6 +2161,18 @@ sub system_read_raw_info_dir($)
     else {
       $raw_info->{RECEIVED_PARENT_UUID} = '-';
     }
+    if(defined $raw_info->{encrypt}) {
+      unless(($raw_info->{encrypt} eq 'openssl_enc') || ($raw_info->{encrypt} eq 'gpg')) {
+        ABORTED($droot, "Illegal \"encrypt\" in raw info file: " . $raw_info->{INFO_FILE});
+        return undef;
+      }
+      if($raw_info->{encrypt} eq 'openssl_enc') {
+        unless($raw_info->{cipher} && $raw_info->{iv}) {
+          ABORTED($droot, "Missing \"cipher\" or \"iv\" in raw info file: " . $raw_info->{INFO_FILE});
+          return undef;
+        }
+      }
+    }
   }
 
   DEBUG("Parsed " . @raw_targets . " raw info files in path: $droot->{PATH}");
@@ -1958,6 +2211,8 @@ sub system_read_raw_info_dir($)
         RECEIVED_PARENT_UUID => $+{parent_uuid} // '-',
         INCOMPLETE           => $+{incomplete} ? 1 : 0,
         encrypt              => $+{encrypt} // "",
+        openssl_cipher       => $+{cipher} // "",
+        openssl_iv           => $+{iv} // "",
         compress             => $+{compress} // "",
       };
       $deprecated_found++;
