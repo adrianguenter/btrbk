@@ -1561,10 +1561,10 @@ sub system_verify_raw
     return undef;
   }
   $file_size = Math::BigInt->new($file_size);
-  DEBUG "Total size (bytes, to end of file): $file_size";
+  DEBUG "File size: $file_size";
   return { file_size => 0 } unless($file_size > 0);
 
-  my ($samples, $target_cmd, $source_cmd);
+  my ($samples, $target_cmd_tokens, $source_cmd_tokens);
 
   if($mode eq 'sample') {
     my $minsamples = config_key($target, "verify_sample_minsamples");
@@ -1572,6 +1572,7 @@ sub system_verify_raw
     my $minsize = floor(humansize_to_bytes(config_key($target, "verify_sample_minsize")));
     my $maxsize = floor(humansize_to_bytes(config_key($target, "verify_sample_maxsize")));
     my $divisor   = config_key($target, "verify_sample_divisor");
+    # Check target verify config
     if($minsamples > $maxsamples) {
       ERROR "verify_sample_minsamples must be less than or equal to verify_sample_maxsamples";
       return undef;
@@ -1585,17 +1586,17 @@ sub system_verify_raw
       return undef;
     }
     DEBUG "verify-sample: min=$minsamples max=$maxsamples minsz=$minsize maxsz=$maxsize div=$divisor";
-    $samples = _calc_verify_samples($file_size, $divisor, $minsamples, $maxsamples, $minsize, $maxsize);
 
+    $samples = _calc_verify_samples($file_size, $divisor, $minsamples, $maxsamples, $minsize, $maxsize);
     if(defined $samples) {
-      $target_cmd = [ qw/ { for i in /, @{$samples->{absolute}}, qw/ ; do dd status=none bs=1M /,
-                      'iflag=count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
-                      "if='${file_path}'", qw/ ; done } / ];
+      $target_cmd_tokens = [ qw/ { for i in /, @{$samples->{absolute}}, qw/ ; do dd status=none bs=1M /,
+                             'iflag=count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
+                             "if='${file_path}'", qw/ ; done } / ];
 
       $samples->{offset}[0] = ($source_offset_start + $samples->{offset}[0]) if($source_offset_start > 0);
-      $source_cmd = [ qw/ ( verify="$( { for i in /, @{$samples->{offset}}, qw/ ; do dd status=none bs=1M /,
-                      'iflag=fullblock,count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
-                      qw/ ; done } / ];
+      $source_cmd_tokens = [ qw/ ( verify="$( { for i in /, @{$samples->{offset}}, qw/ ; do dd status=none bs=1M /,
+                             'iflag=fullblock,count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
+                             qw/ ; done } / ];
     }
     else {
       # minsamples * minsize < filesize, fallback to full verification
@@ -1605,14 +1606,14 @@ sub system_verify_raw
 
   if($mode eq 'full') {
     DEBUG "verify-full";
-    $target_cmd = [ qw/ dd status=none bs=1M /, "if='${file_path}'" ];
-    $source_cmd = [ qw/ ( verify="$( dd status=none bs=1M /, 'iflag=fullblock,count_bytes', "count=$file_size" ];
+    $target_cmd_tokens = [ qw/ dd status=none bs=1M /, "if='${file_path}'" ];
+    $source_cmd_tokens = [ qw/ ( verify="$( dd status=none bs=1M /, 'iflag=fullblock,count_bytes', "count=$file_size" ];
   }
 
   my $digest_bitlen = 256;
   my $digest_hexlen = $digest_bitlen / 4;
   my $target_digest = run_cmd(
-    cmd => [ @{$target_cmd}, qw/ | sha256sum -b - / ],
+    cmd => [ @{$target_cmd_tokens}, qw/ | sha256sum -b - / ],
     check_unsafe => [ { unsafe => $file_path } ],
     rsh => vinfo_rsh($target),
     non_destructive => 1,
@@ -1630,17 +1631,24 @@ sub system_verify_raw
   }
   DEBUG "Target digest: $target_digest (sha256)";
 
-  $source_cmd = {
-      cmd => [ @{$source_cmd},
-               qw/ | sha256sum -b - | cut /, "-d' '", qw/ -f1 )" ; [ "${verify}" != /, "'$target_digest'",
-               qw/ ] && >&2 echo "--VERIFICATION-FAILURE--:${verify}" && exit 3 ; dd status=none bs=1M ) /
+  my $source_cmd = {
+      cmd => [ @{$source_cmd_tokens},
+               qw/ | sha256sum -b - | cut /, "-d' '", qw/ -f1 )" ; [ "$verify" != /, "'${target_digest}'",
+               qw/ ] && >&2 echo /, "ERROR: DIGEST-VERIFICATION-FAILURE=\${verify}:${target_digest}",
+               qw/ && exit 3 ; dd status=none bs=1M ) /
              ],
       compressed_ok => 1,
       catch_stderr => 1, # hack for shell-based run_cmd()
   };
-  #TRACE(Data::Dumper->Dump([$source_digest_pipe], ["pipe"])) if($do_dumper);
 
-  return { file_size => $file_size, samples => $samples, source_cmd => $source_cmd };
+  # NOTE:
+  # * $ret->{source_cmd} can be pushed onto a run_cmd() pipe array, and will digest/skip the incoming stream starting
+  #   from the first byte and ending on $ret->{file_size}. If the digest matches $target_digest then the remainder of
+  #   the stream is sent to the next command in the pipe. If not the shell will exit with code 3, and output can be
+  #   tested for /^ERROR: DIGEST-VERIFICATION-FAILURE=/
+  # * $ret->{samples} is the hash returned by _calc_verify_samples() if mode is 'sample', or undef if mode is 'full',
+  #   and can therefore be checked to determine the resultant mode if 'sample' was requested
+  return { file_size => $file_size, source_cmd => $source_cmd, samples => $samples };
 }
 
 sub btrfs_send_to_file($$$;$$)
@@ -2008,7 +2016,7 @@ sub btrfs_send_to_file($$$;$$)
       ERROR "raw_target_resume requires modern GNU Coreutils split";
       die;
     }
-    if($incomplete_file && $ret =~ /^--VERIFICATION-FAILURE--/) {
+    if($incomplete_file && $ret =~ /^ERROR: DIGEST-VERIFICATION-FAILURE=/) {
       # TODO: Auto-retry?
       ERROR "Incomplete file digest verification failed";
       ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
