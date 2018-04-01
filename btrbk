@@ -1216,7 +1216,7 @@ sub btrfs_subvolume_delete($@)
     my @cmd_target_paths;
     foreach(@$targets) {
       if($_->{node}{BTRBK_RAW}{split}) {
-        push @cmd_target_paths, "$_->{PATH}.split_??"; # unsafe is checked with path.info below
+        push @cmd_target_paths, "$_->{PATH}.split_*"; # unsafe is checked with path.info below
       } else {
         push @cmd_target_paths, { unsafe => $_->{PATH} };
       }
@@ -1549,7 +1549,8 @@ sub system_verify_raw
 {
   my $target = shift // die;
   my $file_path = shift // die;
-  my $mode = shift // die;
+  my $mode = shift // 'full';
+  my $source_offset_start = shift // 0;
 
   my $file_size = run_cmd(cmd => [ 'stat', '-c"%s"', { unsafe => $file_path } ],
                           rsh => vinfo_rsh($target),
@@ -1591,6 +1592,7 @@ sub system_verify_raw
                       'iflag=count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
                       "if='${file_path}'", qw/ ; done } / ];
 
+      $samples->{offset}[0] = ($source_offset_start + $samples->{offset}[0]) if($source_offset_start > 0);
       $source_cmd = [ qw/ ( verify="$( { for i in /, @{$samples->{offset}}, qw/ ; do dd status=none bs=1M /,
                       'iflag=fullblock,count_bytes,skip_bytes', "count=$samples->{size}", 'skip=${i}',
                       qw/ ; done } / ];
@@ -1614,8 +1616,13 @@ sub system_verify_raw
     check_unsafe => [ { unsafe => $file_path } ],
     rsh => vinfo_rsh($target),
     non_destructive => 1,
+    catch_stderr => 1, # hack for shell-based run_cmd()
   );
-  return undef unless(defined($target_digest));
+  return undef unless(defined $target_digest);
+  if($target_digest =~ /^\s*(?:Usage: dd|dd: invalid) /m) {
+    ERROR "raw_target_resume requires modern GNU Coreutils dd";
+    die;
+  }
   ($target_digest) = split(/\s/, $target_digest);
   unless($target_digest =~ /^[0-9A-f]{$digest_hexlen}$/) {
     ABORTED($target, "Failed to digest file: $file_path");
@@ -1695,16 +1702,21 @@ sub btrfs_send_to_file($$$;$$)
   $$ret_vol_received = $vol_received if(ref $ret_vol_received);
 
   my $do_resume = defined(config_key($target, "raw_target_resume"));
-  my $incomplete_vol = vinfo_subvol($target, $target_filename);
-  $do_resume = 0 unless(ref($incomplete_vol) &&
-                        $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} &&
-                        $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} == 1
-                       );
 
-  if ($do_resume) {
-    $incomplete_vol->{node}->{BTRBK_RAW}->{FILE_PATH} = $incomplete_vol->{PATH};
-    $incomplete_vol = $incomplete_vol->{node}->{BTRBK_RAW};
-    INFO "Incomplete raw target backup found: $incomplete_vol->{FILE_PATH}; Attempting to resume";
+  my $incomplete_vol;
+  if($do_resume) {
+    $incomplete_vol = vinfo_subvol($target, $target_filename);
+    $incomplete_vol = undef unless(
+          (ref($incomplete_vol) eq 'HASH') &&
+          exists($incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE}) &&
+          $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} == 1
+        );
+
+    if ($incomplete_vol) {
+      $incomplete_vol->{node}->{BTRBK_RAW}->{FILE_PATH} = $incomplete_vol->{PATH};
+      $incomplete_vol = $incomplete_vol->{node}->{BTRBK_RAW};
+      INFO "Incomplete raw target backup found: $incomplete_vol->{FILE_PATH}; Attempting to resume";
+    }
   }
 
   if($encrypt) {
@@ -1741,15 +1753,17 @@ sub btrfs_send_to_file($$$;$$)
       my $iv_size = $encrypt->{iv_size};
       my $iv;
 
-      if($do_resume) {
+      if($incomplete_vol) {
         my $incomplete_iv_size = length($incomplete_vol->{iv}) / 2;
         if($encrypt->{ciphername} ne $incomplete_vol->{cipher}) {
-          WARN "Cipher has changed in target configuration, canceling resume";
-          $do_resume = 0;
+          ERROR "Cipher has changed in target configuration, canceling resume";
+          ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+          die;
         }
         elsif($iv_size != $incomplete_iv_size) {
-          WARN "IV size has changed in target configuration, canceling resume";
-          $do_resume = 0;
+          ERROR "IV size has changed in target configuration, canceling resume";
+          ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+          die;
         }
         else {
           DEBUG "Resume using cipher '$incomplete_vol->{cipher}' and IV '$incomplete_vol->{iv}'";
@@ -1757,8 +1771,7 @@ sub btrfs_send_to_file($$$;$$)
           $raw_info{iv} = $iv;
         }
       }
-
-      unless($do_resume) {
+      else {
         # NOTE: iv is always generated locally!
         if($iv_size) {
           INFO "Generating iv for openssl encryption (cipher=$encrypt->{ciphername})";
@@ -1842,15 +1855,69 @@ sub btrfs_send_to_file($$$;$$)
     }
   }
 
-  my $target_seek_bytes = 0;
-  if ($do_resume) {
+  my @dd_options = ();
+  my @split_options = ();
+  push @split_options, qw(-a 5 --numeric-suffixes=0) if($do_resume and not $incomplete_vol); # Incomplete needs to set start point
+
+  # Verify
+  my $incomplete_file;
+  my $split_bytes;
+  my $split_remaining_bytes;
+  if($incomplete_vol) {
+    $incomplete_file = $incomplete_vol->{FILE_PATH};
+    my $source_offset_start = 0;
+    if($split) {
+      # Get and parse information about the state of existing split files on the target
+      unless(defined($incomplete_vol->{split}) && ($split eq $incomplete_vol->{split})) {
+        # Incomplete volume is either unsplit or split on a different boundary than the target's current config
+        ERROR "Split configuration has changed for raw target, canceling resume";
+        ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+        die;
+      }
+      my $incomplete_split_info = run_cmd(
+          cmd => [ qw/ l="$(ls -1 /, "${incomplete_file}.split_*", qw/ )"; /,
+                   qw/ echo "$l" | wc -l; echo "$l" | head -n1 ; echo "$l" | tail -n1 /
+                 ],
+          check_unsafe => [ { unsafe => $incomplete_file, } ],
+          rsh => vinfo_rsh($target),
+          non_destructive => 1
+      );
+      unless(defined $incomplete_split_info) {
+        ERROR "Failed getting split file info";
+        return undef;
+      }
+      my ($split_count, $split_first, $split_last) = split(/\n/, $incomplete_split_info);
+      unless($split_first =~ /^${incomplete_file}\.split_/) {
+        ERROR "No split files found, canceling resume";
+        ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+        die;
+      }
+      unless($split_first =~ /_[0-9]{5}$/) {
+        ERROR "Split was not created using numeric suffixes of length 5, canceling resume";
+        ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+        die;
+      }
+      $incomplete_file = $split_last;
+      push @split_options, qw(-a 5), "--numeric-suffixes=${split_count}";
+      $split_bytes = humansize_to_bytes($split);
+      $source_offset_start = ($split_count - 1) * $split_bytes;
+      #DEBUG ">>${split_count}:${split_first}:${split_last}";die;
+    }
+    elsif(exists $incomplete_vol->{split}) {
+      # Incomplete volume is split but split is disabled in the target's current config
+      ERROR "Split configuration has changed for raw target, canceling resume";
+      ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+      die;
+    }
+
     my $verify = system_verify_raw(
         $target,
-        $incomplete_vol->{FILE_PATH},
-        (config_key($target, 'raw_target_resume') eq 'verify-sample') ? 'sample' : 'full'
+        $incomplete_file,
+        (config_key($target, 'raw_target_resume') eq 'verify-sample') ? 'sample' : 'full',
+        $source_offset_start
     );
     unless(defined $verify) {
-      ERROR "Failed to digest incomplete file: $vol_received->{PRINT}";
+      ERROR "Failed to digest incomplete file: $incomplete_file";
       die;
     }
     unless($verify->{file_size} > 0) {
@@ -1859,16 +1926,21 @@ sub btrfs_send_to_file($$$;$$)
       die;
     }
     push @cmd_pipe, $verify->{source_cmd};
-    $target_seek_bytes = $verify->{file_size};
+    push(@dd_options, 'iflag=fullblock,count_bytes', 'oflag=seek_bytes', "seek=$verify->{file_size}");
+    $split_remaining_bytes = $split_bytes - $verify->{file_size} if($split);
   }
 
   if($split) {
-    $do_resume = 0; # TODO: Implement?
+    my $split_cmd = [ 'split', '-b', uc($split), @split_options, '-', "${target_path}/${target_filename}.split_" ];
+    if($incomplete_vol) {
+      $split_cmd = [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"),
+                     "of=${incomplete_file}", @dd_options, "count=${split_remaining_bytes}", ';', @{$split_cmd} ];
+    }
 
     # NOTE: we do not append a ".split" suffix on $target_filename here, as this propagates to ".info" file
     $raw_info{split} = $split;
     push @cmd_pipe, {
-      cmd => [ 'split', '-b', uc($split), '-', "${target_path}/${target_filename}.split_" ],
+      cmd => $split_cmd,
       check_unsafe => [ { unsafe => "${target_path}/${target_filename}.split_" } ],
       rsh => vinfo_rsh($target, disable_compression => $compress || config_compress_hash($target, "stream_compress")),
       rsh_compress_in => $compress || config_compress_hash($target, "stream_compress"),
@@ -1888,7 +1960,7 @@ sub btrfs_send_to_file($$$;$$)
       # uses st_blksize from fstat(2) (with a minimum of 128K) to
       # determine the block size.
       cmd => [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"),
-               'oflag=seek_bytes' , "seek=${target_seek_bytes}", "of=${target_path}/${target_filename}"
+               "of=${target_path}/${target_filename}", @dd_options
              ],
       check_unsafe => [ { unsafe => "${target_path}/${target_filename}" } ],
       #redirect_to_file => { unsafe => "${target_path}/${target_filename}" },  # alternative (use shell redirection), less overhead on local filesystems (barely measurable):
@@ -1924,9 +1996,17 @@ sub btrfs_send_to_file($$$;$$)
     $ret = run_cmd(@cmd_pipe);
   }
 
-  if ($do_resume) {
-    if ($ret =~ /--VERIFICATION-FAILURE--/) {
-      # TODO: Auto-retry
+  if($do_resume) {
+    if($ret =~ /^\s*(?:Usage: dd|dd: invalid) /m) {
+      ERROR "raw_target_resume requires modern GNU Coreutils dd";
+      die;
+    }
+    if($split && $ret =~ /^split: unrecognized option: numeric-suffixes$/m) {
+      ERROR "raw_target_resume requires modern GNU Coreutils split";
+      die;
+    }
+    if($incomplete_file && $ret =~ /^--VERIFICATION-FAILURE--/) {
+      # TODO: Auto-retry?
       ERROR "Incomplete file digest verification failed";
       ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
       die;
@@ -1938,7 +2018,7 @@ sub btrfs_send_to_file($$$;$$)
     # can not rely on the exit status of the command pipe, and a shell
     # redirection as well as "dd" always creates the target file.
     # Note that "split" does not create empty files.
-    my $test_postfix = ($split ? ".split_aa" : "");
+    my $test_postfix = ($split ? ".split_*" : "");
     DEBUG "Testing target data file (non-zero size)";
     $ret = run_cmd({
       cmd  => ['test', '-s', { unsafe => "${target_path}/${target_filename}${test_postfix}" } ],
