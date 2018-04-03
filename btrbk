@@ -1613,11 +1613,11 @@ sub system_verify_raw
   my $digest_bitlen = 256;
   my $digest_hexlen = $digest_bitlen / 4;
   my $target_digest = run_cmd(
-    cmd => [ @{$target_cmd_tokens}, qw/ | sha256sum -b - / ],
-    check_unsafe => [ { unsafe => $file_path } ],
-    rsh => vinfo_rsh($target),
-    non_destructive => 1,
-    catch_stderr => 1, # hack for shell-based run_cmd()
+      cmd => [ @{$target_cmd_tokens}, qw/ | sha256sum -b - / ],
+      check_unsafe => [ { unsafe => $file_path } ],
+      rsh => vinfo_rsh($target),
+      non_destructive => 1,
+      catch_stderr => 1, # hack for shell-based run_cmd()
   );
   return undef unless(defined $target_digest);
   if($target_digest =~ /^\s*(?:Usage: dd|dd: invalid) /m) {
@@ -1650,6 +1650,53 @@ sub system_verify_raw
   #   and can therefore be checked to determine the resultant mode if 'sample' was requested
   return { file_size => $file_size, source_cmd => $source_cmd, samples => $samples };
 }
+
+sub system_kdf_generate_key($$)
+{
+  my $backend = shift // die;
+  my $keysize = shift // die;
+  my $key;
+  my %vars;
+
+  my $backend_name = $backend;
+  $backend_name =~ s/^.*\///;
+
+  DEBUG "Initializing kdf_backend: $backend_name";
+  my $ret = run_cmd(cmd => [ $backend, $keysize ],
+                           non_destructive => 1,
+                           name => $backend_name
+                          );
+  return undef unless(defined($ret));
+  foreach(split("\n", $ret)) {
+    chomp;
+    next if /^\s*$/; # ignore empty lines
+    if(/^KEY=([0-9a-fA-f]+)/) {
+      $key = $1;
+    }
+    elsif(/^([a-z_]+)=(.*)/) {
+      my $info_key = 'kdf_' . $1;
+      my $info_val = $2;
+      DEBUG "Adding raw_info from kdf_backend: $info_key=$info_val";
+      $vars{$info_key} = $info_val;
+    }
+    else {
+      ERROR "Ambiguous line from kdf_backend: $_";
+      return undef;
+    }
+  }
+  unless($key && (length($key) == ($keysize * 2))) {
+    ERROR "Ambiguous key value from kdf_backend: $_";
+    return undef;
+  }
+  return ($key, %vars);
+}
+#sub new_key { return 'x_' . shift; }
+#$loglevel = 7;
+#require_data_dumper();
+#my %hash = ( key1 => 'val1', key2 => 'val2' );
+#my %newhash = map { (sub { return 'kdf_' . shift })->($_) => $hash{$_} } keys %hash;
+#TRACE(Dumper(\%newhash));
+#die;
 
 sub btrfs_send_to_file($$$;$$)
 {
@@ -1709,10 +1756,10 @@ sub btrfs_send_to_file($$$;$$)
   my $vol_received = vinfo_child($target, $target_filename);
   $$ret_vol_received = $vol_received if(ref $ret_vol_received);
 
-  my $do_resume = defined(config_key($target, "raw_target_resume"));
-
+  my $do_resume_incomplete = defined(config_key($target, "raw_target_resume"));
   my $incomplete_vol;
-  if($do_resume) {
+  if($do_resume_incomplete) {
+    # Search for an existing incomplete info file on the target
     $incomplete_vol = vinfo_subvol($target, $target_filename);
     $incomplete_vol = undef unless(
           (ref($incomplete_vol) eq 'HASH') &&
@@ -1742,7 +1789,7 @@ sub btrfs_send_to_file($$$;$$)
       #   desired. This option can be used to achieve that with the cost
       #   of slower random generation.
 
-      if($do_resume) {
+      if($do_resume_incomplete) {
         # NOTE: GnuPG can't be resumed as it doesn't generate reproducable output
         ERROR "raw_target_resume is incompatible with GnuPG encryption, please use OpenSSL";
         die;
@@ -1776,11 +1823,9 @@ sub btrfs_send_to_file($$$;$$)
           ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
           die;
         }
-        else {
-          DEBUG "Resume using cipher '$incomplete_vol->{cipher}' and IV '$incomplete_vol->{iv}'";
-          $iv = $incomplete_vol->{iv};
-          $raw_info{iv} = $iv;
-        }
+        DEBUG "Resume using cipher '$incomplete_vol->{cipher}' and IV '$incomplete_vol->{iv}'";
+        $iv = $incomplete_vol->{iv};
+        $raw_info{iv} = $iv;
       }
       else {
         # NOTE: iv is always generated locally!
@@ -1807,42 +1852,14 @@ sub btrfs_send_to_file($$$;$$)
           $kdf_session_key = undef;
           %kdf_vars = ();
         }
-        if($kdf_session_key) {
+        elsif($kdf_session_key) {
           INFO "Reusing session key for: $vol_received->{PRINT}";
         }
         else {
           # run kdf backend, set session key and vars
           DEBUG "Generating session key for: $vol_received->{PRINT}";
-          my $kdf_backend_name = $encrypt->{kdf_backend};
-          $kdf_backend_name =~ s/^.*\///;
-
           print STDOUT "\nGenerate session key for " . ($encrypt->{kdf_keygen_each} ? "\"$vol_received->{PRINT}\"" : "all raw backups") . ":\n";
-          my $kdf_values = run_cmd(cmd => [ $encrypt->{kdf_backend}, $encrypt->{kdf_keysize} ],
-                                   non_destructive => 1,
-                                   name => $kdf_backend_name
-                                  );
-          return undef unless(defined($kdf_values));
-          foreach(split("\n", $kdf_values)) {
-            chomp;
-            next if /^\s*$/; # ignore empty lines
-            if(/^KEY=([0-9a-fA-f]+)/) {
-              $kdf_session_key = $1;
-            }
-            elsif(/^([a-z_]+)=(.*)/) {
-              my $info_key = 'kdf_' . $1;
-              my $info_val = $2;
-              DEBUG "Adding raw_info from kdf_backend: $info_key=$info_val";
-              $kdf_vars{$info_key} = $info_val;
-            }
-            else {
-              ERROR "Ambiguous line from kdf_backend: $encrypt->{kdf_backend}";
-              return undef;
-            }
-          }
-          unless($kdf_session_key && (length($kdf_session_key) == ($encrypt->{kdf_keysize} * 2))) {
-            ERROR "Ambiguous key value from kdf_backend: $encrypt->{kdf_backend}";
-            return undef;
-          }
+          ($kdf_session_key, %kdf_vars) = system_kdf_generate_key($encrypt->{kdf_backend}, $encrypt->{kdf_keysize});
           INFO "Generated session key for: $vol_received->{PRINT}";
         }
         $encrypt_key = $kdf_session_key;
@@ -1868,9 +1885,9 @@ sub btrfs_send_to_file($$$;$$)
 
   my @dd_options = ();
   my @split_options = ();
-  push @split_options, qw(-a 5 --numeric-suffixes=0) if($do_resume and not $incomplete_vol); # Incomplete needs to set start point
+  push @split_options, qw(-a 5 --numeric-suffixes=0) if($do_resume_incomplete and not $incomplete_vol); # Incomplete needs to set start point
 
-  # Verify
+  # Verify incomplete
   my $incomplete_file;
   my $split_bytes;
   my $split_remaining_bytes;
@@ -1942,16 +1959,16 @@ sub btrfs_send_to_file($$$;$$)
   }
 
   if($split) {
-    my $split_cmd = [ 'split', '-b', uc($split), @split_options, '-', "${target_path}/${target_filename}.split_" ];
+    my $split_cmd_tokens = [ 'split', '-b', uc($split), @split_options, '-', "${target_path}/${target_filename}.split_" ];
     if($incomplete_vol) {
-      $split_cmd = [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"),
-                     "of=${incomplete_file}", @dd_options, "count=${split_remaining_bytes}", ';', @{$split_cmd} ];
+      $split_cmd_tokens = [ 'dd', 'status=none', 'bs=' . config_key($target, "raw_target_block_size"),
+                     "of=${incomplete_file}", @dd_options, "count=${split_remaining_bytes}", ';', @{$split_cmd_tokens} ];
     }
 
     # NOTE: we do not append a ".split" suffix on $target_filename here, as this propagates to ".info" file
     $raw_info{split} = $split;
     push @cmd_pipe, {
-      cmd => $split_cmd,
+      cmd => $split_cmd_tokens,
       check_unsafe => [ { unsafe => "${target_path}/${target_filename}.split_" } ],
       rsh => vinfo_rsh($target, disable_compression => $compress || config_compress_hash($target, "stream_compress")),
       rsh_compress_in => $compress || config_compress_hash($target, "stream_compress"),
@@ -2007,7 +2024,7 @@ sub btrfs_send_to_file($$$;$$)
     $ret = run_cmd(@cmd_pipe);
   }
 
-  if($do_resume) {
+  if($do_resume_incomplete) {
     if($ret =~ /^\s*(?:Usage: dd|dd: invalid) /m) {
       ERROR "raw_target_resume requires modern GNU Coreutils dd";
       die;
