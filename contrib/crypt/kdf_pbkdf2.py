@@ -29,6 +29,7 @@ import sys
 import os
 import getpass
 import hashlib
+import binascii
 
 def passprompt():
     pprompt = lambda: (getpass.getpass("Passphrase: "), getpass.getpass("Retype passphrase: "))
@@ -38,23 +39,24 @@ def passprompt():
         p1, p2 = pprompt()
     return p1
 
+hash_name = "sha256"
+iterations = 300000
+salt_length = 16
+
 if len(sys.argv) <= 1:
     print("Usage: {} <dklen>".format(sys.argv[0]), file=sys.stderr)
     sys.exit(1)
 
-hash_name = "sha256"
-iterations = 300000
 dklen = int(sys.argv[1])
-salt = os.urandom(16)
+
+salt = os.urandom(salt_length) if (len(sys.argv) <= 2) else binascii.a2b_hex(sys.argv[2].strip())
+
 password = passprompt().encode("utf-8")
 
 dk = hashlib.pbkdf2_hmac(hash_name=hash_name, password=password, salt=salt, iterations=iterations, dklen=dklen)
 
-salt_hex = "".join(["{:02x}".format(x) for x in salt])
-dk_hex = "".join(["{:02x}".format(x) for x in dk])
-
-print("KEY=" + dk_hex);
-print("algoritm=pbkdf2_hmac");
+print("KEY=" + dk.hex());
+print("algorithm=pbkdf2_hmac");
 print("hash_name=" + hash_name);
-print("salt=" + salt_hex);
+print("salt=" + salt.hex());
 print("iterations=" + str(iterations));
