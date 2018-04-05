@@ -32,6 +32,7 @@ use Carp qw(confess);
 use Getopt::Long qw(GetOptions);
 use Time::Local qw( timelocal timegm timegm_nocheck );
 use POSIX qw(floor);
+use Storable qw(dclone);
 use Math::BigFloat try => 'GMP';
 use Math::BigInt try => 'GMP';
 
@@ -290,8 +291,6 @@ my @transaction_log;
 my %config_override;
 my @tm_now;  # current localtime ( sec, min, hour, mday, mon, year, wday, yday, isdst )
 my %warn_once;
-my %kdf_vars;
-my $kdf_session_key;
 
 
 $SIG{__DIE__} = sub {
@@ -1484,6 +1483,28 @@ sub btrfs_send_receive($$$$)
   return 1;
 }
 
+
+sub _string_value_match($$)
+{
+  my $a = shift;
+  my $b = shift;
+  # Returns 1 only if both arguments are undef or have string equality.
+  return !defined($a) && !defined($b) || $a eq $b;
+}
+
+
+sub _string_value_diff($$;$$)
+{
+  my $a = shift;
+  $a = defined $a ? "\"$a\"" : 'undefined';
+  my $b = shift;
+  $b = defined $b ? "\"$b\"" : 'undefined';
+  my $a_label = scalar @_ ? (shift . ': ') : '';
+  my $b_label = scalar @_ ? (shift . ': ') : '';
+  return "${a_label}${a} => ${b_label}${b}";
+}
+
+
 sub _calc_verify_samples
 {
   my $file_size = shift // die;
@@ -1544,6 +1565,7 @@ sub _calc_verify_samples
   DEBUG "Samples (offsets): @offset_start_list";
   return { size => $sample_size, count => $sample_count, absolute => \@start_list, offset => \@offset_start_list };
 }
+
 
 sub system_verify_raw
 {
@@ -1651,10 +1673,12 @@ sub system_verify_raw
   return { file_size => $file_size, source_cmd => $source_cmd, samples => $samples };
 }
 
-sub system_kdf_generate_key($$)
+
+sub system_kdf_generate_key($$;$)
 {
   my $backend = shift // die;
   my $keysize = shift // die;
+  my $salt = shift;
   my $key;
   my %vars;
 
@@ -1662,7 +1686,7 @@ sub system_kdf_generate_key($$)
   $backend_name =~ s/^.*\///;
 
   DEBUG "Initializing kdf_backend: $backend_name";
-  my $ret = run_cmd(cmd => [ $backend, $keysize ],
+  my $ret = run_cmd(cmd => [ $backend, $keysize, $salt ? $salt : () ],
                            non_destructive => 1,
                            name => $backend_name
                           );
@@ -1690,13 +1714,46 @@ sub system_kdf_generate_key($$)
   }
   return ($key, %vars);
 }
-#sub new_key { return 'x_' . shift; }
-#$loglevel = 7;
-#require_data_dumper();
-#my %hash = ( key1 => 'val1', key2 => 'val2' );
-#my %newhash = map { (sub { return 'kdf_' . shift })->($_) => $hash{$_} } keys %hash;
-#TRACE(Dumper(\%newhash));
-#die;
+
+
+{
+  my %global_kdf_sessions; # { $backend:$keysize => { key => $key, vars => { var1 => $val1, ... } } }
+
+  sub set_global_kdf_session($$$)
+  {
+    my $config = shift // die;
+    my $key = shift // die;
+    # Creates and stores a deep copy of the kdf vars hash to prevent modifications
+    my $vars = dclone(shift // die);
+    my $backend = config_key($config, 'kdf_backend') // die;
+    my $keysize = config_key($config, 'kdf_keysize') // die;
+
+    $global_kdf_sessions{"$backend:$keysize"} = { key => $key, vars => $vars };
+  }
+
+  sub get_global_kdf_session($)
+  {
+      my $config = shift // die;
+      my $backend = config_key($config, 'kdf_backend') // die;
+      my $keysize = config_key($config, 'kdf_keysize') // die;
+      return ( undef, undef ) unless(exists $global_kdf_sessions{"$backend:$keysize"});
+      my $key = $global_kdf_sessions{"$backend:$keysize"}{key};
+      # Creates and returns a deep copy of the kdf vars hash to prevent modifications
+      my $vars = dclone($global_kdf_sessions{"$backend:$keysize"}{vars});
+      return ( $key, $vars );
+  }
+}
+
+
+# TODO REMOVE ##########
+#  if ($incomplete_vol && !_string_value_match($incomplete_vol->{encrypt}, $encrypt->{type})) {
+#    ERROR "Encryption settings have been modified ("
+#        . _string_value_diff($incomplete_vol->{encrypt}, $encrypt->{type}, 'incomplete', 'config')
+#        . "), canceling resume";
+#    ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+#    die;
+#  }
+
 
 sub btrfs_send_to_file($$$;$$)
 {
@@ -1845,24 +1902,65 @@ sub btrfs_send_to_file($$$;$$)
         if($encrypt->{kdf_backend}) {
           WARN "Both openssl_keyfile and kdf_backend are configured, ignoring kdf_backend!";
         }
+        if($incomplete_vol && $incomplete_vol->{kdf_algorithm}) {
+          ERROR "Incomplete raw file appears to have been encrypted using a KDF-derived key,"
+              . " but the current target config uses openssl_keyfile";
+          ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+          die;
+        }
         $encrypt_key = '$(cat ' . $encrypt->{keyfile} . ')';
       }
       elsif($encrypt->{kdf_backend}) {
-        if($encrypt->{kdf_keygen_each}) {
-          $kdf_session_key = undef;
-          %kdf_vars = ();
+        my $kdf_salt;
+        my $kdf_key;
+        my %kdf_vars;
+        my @kdf_var_keys = qw/kdf_algorithm kdf_hash_name kdf_iterations kdf_salt/;
+
+        # TODO: Global (once) logic should apply based on the context of the kdf_keygen config value (look at sub config_value)
+
+        if(!$encrypt->{kdf_keygen_each}) {
+          my ($global_kdf_key, $global_kdf_vars) = get_global_kdf_session($target);
+          if($global_kdf_key) {
+            $kdf_key = $global_kdf_key;
+            %kdf_vars = %$global_kdf_vars;
+          }
         }
-        elsif($kdf_session_key) {
+
+        if($incomplete_vol) {
+          if(!$incomplete_vol->{kdf_algorithm}) {
+            ERROR "Incomplete raw file appears to have been encrypted using a keyfile, but the"
+                . " current target config uses a KDF-derived key";
+            ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+            die;
+          }
+          $kdf_salt = $incomplete_vol->{kdf_salt};
+          # TRACE(Dumper(\{%{$incomplete_vol}{@kdf_var_keys}}));
+          # Need to further compare the KDF vars using method in TRACE line above
+          unless(!$kdf_key or $kdf_vars{kdf_salt} eq $kdf_salt) {
+            $kdf_key = undef;
+            %kdf_vars = ();
+          }
+          unless($kdf_key) {
+            INFO "Regenerating previous session key for incomplete raw target backup";
+            print STDOUT "\n=== ENTER THE SAME PASSPHRASE USED WHEN THE TRANSFER WAS STARTED OR RESUME WILL FAIL ===\n";
+          }
+        }
+
+        if($kdf_key) {
           INFO "Reusing session key for: $vol_received->{PRINT}";
         }
         else {
           # run kdf backend, set session key and vars
           DEBUG "Generating session key for: $vol_received->{PRINT}";
-          print STDOUT "\nGenerate session key for " . ($encrypt->{kdf_keygen_each} ? "\"$vol_received->{PRINT}\"" : "all raw backups") . ":\n";
-          ($kdf_session_key, %kdf_vars) = system_kdf_generate_key($encrypt->{kdf_backend}, $encrypt->{kdf_keysize});
+          print STDOUT "\nGenerate session key for " . ($encrypt->{kdf_keygen_each} ? "\"$vol_received->{PRINT}\"" : "all raw backups") . ":\n" unless($incomplete_vol);
+          ($kdf_key, %kdf_vars) = system_kdf_generate_key($encrypt->{kdf_backend}, $encrypt->{kdf_keysize}, $kdf_salt);
           INFO "Generated session key for: $vol_received->{PRINT}";
+
+          if(!$encrypt->{kdf_keygen_each}) {
+            set_global_kdf_session($target, $kdf_key, \%kdf_vars);
+          }
         }
-        $encrypt_key = $kdf_session_key;
+        $encrypt_key = $kdf_key;
         %raw_info = ( %kdf_vars, %raw_info );
       }
 
