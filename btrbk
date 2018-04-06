@@ -1715,7 +1715,7 @@ sub system_kdf_generate_key($$;$)
       my $config = shift // die;
       my $backend = config_key($config, 'kdf_backend') // die;
       my $keysize = config_key($config, 'kdf_keysize') // die;
-      return ( undef, undef ) unless(exists $global_kdf_sessions{"$backend:$keysize"});
+      return unless(exists $global_kdf_sessions{"$backend:$keysize"});
       my $key = $global_kdf_sessions{"$backend:$keysize"}{key};
       # Creates and returns a deep copy of the kdf vars hash to prevent modifications
       my $vars = dclone($global_kdf_sessions{"$backend:$keysize"}{vars});
@@ -2102,8 +2102,9 @@ sub btrfs_send_to_file($$$;$$)
     }
     if($incomplete_file && $ret =~ /^ERROR: DIGEST-VERIFICATION-FAILURE=/) {
       # TODO: Auto-retry?
-      ERROR "Incomplete file digest verification failed";
-      ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+      ERROR "Incomplete file digest verification failed"
+          . ($encrypt->{kdf_backend} ? " (Did you enter the correct passphrase?)" : '');
+      ERROR "Please retry or delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
       die;
     }
   }
