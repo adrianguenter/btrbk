@@ -1484,27 +1484,6 @@ sub btrfs_send_receive($$$$)
 }
 
 
-sub _string_value_match($$)
-{
-  my $a = shift;
-  my $b = shift;
-  # Returns 1 only if both arguments are undef or have string equality.
-  return !defined($a) && !defined($b) || $a eq $b;
-}
-
-
-sub _string_value_diff($$;$$)
-{
-  my $a = shift;
-  $a = defined $a ? "\"$a\"" : 'undefined';
-  my $b = shift;
-  $b = defined $b ? "\"$b\"" : 'undefined';
-  my $a_label = scalar @_ ? (shift . ': ') : '';
-  my $b_label = scalar @_ ? (shift . ': ') : '';
-  return "${a_label}${a} => ${b_label}${b}";
-}
-
-
 sub _calc_verify_samples
 {
   my $file_size = shift // die;
@@ -1743,16 +1722,6 @@ sub system_kdf_generate_key($$;$)
       return ( $key, $vars );
   }
 }
-
-
-# TODO REMOVE ##########
-#  if ($incomplete_vol && !_string_value_match($incomplete_vol->{encrypt}, $encrypt->{type})) {
-#    ERROR "Encryption settings have been modified ("
-#        . _string_value_diff($incomplete_vol->{encrypt}, $encrypt->{type}, 'incomplete', 'config')
-#        . "), canceling resume";
-#    ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
-#    die;
-#  }
 
 
 sub btrfs_send_to_file($$$;$$)
