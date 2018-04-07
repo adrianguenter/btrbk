@@ -1645,8 +1645,8 @@ sub system_verify_raw
   # NOTE:
   # * $ret->{source_cmd} can be pushed onto a run_cmd() pipe array, and will digest/skip the incoming stream starting
   #   from the first byte and ending on $ret->{file_size}. If the digest matches $target_digest then the remainder of
-  #   the stream is sent to the next command in the pipe. If not the shell will exit with code 3, and output can be
-  #   tested for /^ERROR: DIGEST-VERIFICATION-FAILURE=/
+  #   the stream is sent to stdout (the next piped command). If not, the shell will exit with code 3, and output can
+  #   be tested for /^ERROR: DIGEST-VERIFICATION-FAILURE=/
   # * $ret->{samples} is the hash returned by _calc_verify_samples() if mode is 'sample', or undef if mode is 'full',
   #   and can therefore be checked to determine the resultant mode if 'sample' was requested
   return { file_size => $file_size, source_cmd => $source_cmd, samples => $samples };
@@ -1696,30 +1696,35 @@ sub system_kdf_generate_key($$;$)
 
 
 {
-  my %global_kdf_sessions; # { $backend:$keysize => { key => $key, vars => { var1 => $val1, ... } } }
+  my %shared_kdf_sessions;
 
-  sub set_global_kdf_session($$$)
+  sub set_shared_kdf_session($$$)
   {
     my $config = shift // die;
     my $key = shift // die;
-    # Creates and stores a deep copy of the kdf vars hash to prevent modifications
-    my $vars = dclone(shift // die);
+    # Creates and stores a copy of the kdf vars hash to prevent modifications
+    my %vars = %{shift // die};
+    # Vars must be a flat hash of non-ref values
+    die if(grep { ref($vars{$_}) } keys %vars);
+    # We bind the session to the address of the config object that sets kdf_keygen,
+    # as well as the backend path and keysize
+    my $config_addr = int(config_key_context($config, 'kdf_keygen') // die);
+    die unless(config_key($config, 'kdf_keygen') eq "once");
     my $backend = config_key($config, 'kdf_backend') // die;
     my $keysize = config_key($config, 'kdf_keysize') // die;
-
-    $global_kdf_sessions{"$backend:$keysize"} = { key => $key, vars => $vars };
+    $shared_kdf_sessions{"$config_addr:$backend:$keysize"} = { key => $key, vars => \%vars };
   }
 
-  sub get_global_kdf_session($)
+  sub get_shared_kdf_session($)
   {
       my $config = shift // die;
+      my $config_addr = int(config_key_context($config, 'kdf_keygen') // die);
       my $backend = config_key($config, 'kdf_backend') // die;
       my $keysize = config_key($config, 'kdf_keysize') // die;
-      return unless(exists $global_kdf_sessions{"$backend:$keysize"});
-      my $key = $global_kdf_sessions{"$backend:$keysize"}{key};
-      # Creates and returns a deep copy of the kdf vars hash to prevent modifications
-      my $vars = dclone($global_kdf_sessions{"$backend:$keysize"}{vars});
-      return ( $key, $vars );
+      return (undef, undef) unless(exists $shared_kdf_sessions{"$config_addr:$backend:$keysize"});
+      my %session = $shared_kdf_sessions{"$config_addr:$backend:$keysize"};
+      # Creates and returns a copy of the kdf vars hash to prevent modifications
+      return ($session{key}, %{$session{vars}});
   }
 }
 
@@ -1798,6 +1803,8 @@ sub btrfs_send_to_file($$$;$$)
       $incomplete_vol = $incomplete_vol->{node}->{BTRBK_RAW};
       INFO "Incomplete raw target backup found: $incomplete_vol->{FILE_PATH}; Attempting to resume";
     }
+    # NOTE: We don't need to check if certain configuration options have changed (encrypt type, compress)
+    # because they affect the filename, which is the basis for matching a file to resume on the target.
   }
 
   if($encrypt) {
@@ -1817,7 +1824,7 @@ sub btrfs_send_to_file($$$;$$)
 
       if($do_resume_incomplete) {
         # NOTE: GnuPG can't be resumed as it doesn't generate reproducable output
-        ERROR "raw_target_resume is incompatible with GnuPG encryption, please use OpenSSL";
+        ERROR "raw_target_resume is incompatible with GnuPG encryption, please use openssl_enc";
         die;
       }
 
@@ -1840,12 +1847,12 @@ sub btrfs_send_to_file($$$;$$)
       if($incomplete_vol) {
         my $incomplete_iv_size = length($incomplete_vol->{iv}) / 2;
         if($encrypt->{ciphername} ne $incomplete_vol->{cipher}) {
-          ERROR "Cipher has changed in target configuration, canceling resume";
+          ERROR "Cipher has changed in target configuration";
           ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
           die;
         }
         elsif($iv_size != $incomplete_iv_size) {
-          ERROR "IV size has changed in target configuration, canceling resume";
+          ERROR "IV size has changed in target configuration";
           ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
           die;
         }
@@ -1885,13 +1892,12 @@ sub btrfs_send_to_file($$$;$$)
         my %kdf_vars;
         my @kdf_var_keys = qw/kdf_algorithm kdf_hash_name kdf_iterations kdf_salt/;
 
-        # TODO: Global (once) logic should apply based on the context of the kdf_keygen config value (look at sub config_value)
-
         if(!$encrypt->{kdf_keygen_each}) {
-          my ($global_kdf_key, $global_kdf_vars) = get_global_kdf_session($target);
-          if($global_kdf_key) {
-            $kdf_key = $global_kdf_key;
-            %kdf_vars = %$global_kdf_vars;
+          # NOTE: We use intermediate vars here because get_shared_kdf_session() returns a hashref instead of a hash
+          my ($shared_kdf_key, $shared_kdf_vars) = get_shared_kdf_session($target);
+          if($shared_kdf_key) {
+            $kdf_key = $shared_kdf_key;
+            %kdf_vars = %$shared_kdf_vars;
           }
         }
 
@@ -1902,16 +1908,21 @@ sub btrfs_send_to_file($$$;$$)
             ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
             die;
           }
+          if(grep { not exists($incomplete_vol->{$_}) } @kdf_var_keys) {
+            ERROR "Incomplete raw file KDF data is invalid";
+            ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
+            die;
+          }
           $kdf_salt = $incomplete_vol->{kdf_salt};
-          # TRACE(Dumper(\{%{$incomplete_vol}{@kdf_var_keys}}));
-          # Need to further compare the KDF vars using method in TRACE line above
           unless(!$kdf_key or $kdf_vars{kdf_salt} eq $kdf_salt) {
+            # Unset the received shared session key if it doesn't match the incomplete file data
             $kdf_key = undef;
             %kdf_vars = ();
           }
           unless($kdf_key) {
             INFO "Regenerating previous session key for incomplete raw target backup";
-            print STDOUT "\n=== ENTER THE SAME PASSPHRASE USED WHEN THE TRANSFER WAS STARTED OR RESUME WILL FAIL ===\n";
+            print STDOUT "\n>>> ENTER THE SAME PASSPHRASE USED AS WHEN THE <<<\n";
+            print STDOUT   ">>>   BACKUP WAS CREATED OR RESUME WILL FAIL   <<<\n";
           }
         }
 
@@ -1922,11 +1933,12 @@ sub btrfs_send_to_file($$$;$$)
           # run kdf backend, set session key and vars
           DEBUG "Generating session key for: $vol_received->{PRINT}";
           print STDOUT "\nGenerate session key for " . ($encrypt->{kdf_keygen_each} ? "\"$vol_received->{PRINT}\"" : "all raw backups") . ":\n" unless($incomplete_vol);
+          # $kdf_salt is undef unless we're regenerating a key for an incomplete file
           ($kdf_key, %kdf_vars) = system_kdf_generate_key($encrypt->{kdf_backend}, $encrypt->{kdf_keysize}, $kdf_salt);
           INFO "Generated session key for: $vol_received->{PRINT}";
 
           if(!$encrypt->{kdf_keygen_each}) {
-            set_global_kdf_session($target, $kdf_key, \%kdf_vars);
+            set_shared_kdf_session($target, $kdf_key, \%kdf_vars);
           }
         }
         $encrypt_key = $kdf_key;
@@ -1965,7 +1977,7 @@ sub btrfs_send_to_file($$$;$$)
       # Get and parse information about the state of existing split files on the target
       unless(defined($incomplete_vol->{split}) && ($split eq $incomplete_vol->{split})) {
         # Incomplete volume is either unsplit or split on a different boundary than the target's current config
-        ERROR "Split configuration has changed for raw target, canceling resume";
+        ERROR "Split configuration has changed for raw target";
         ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
         die;
       }
@@ -1983,12 +1995,12 @@ sub btrfs_send_to_file($$$;$$)
       }
       my ($split_count, $split_first, $split_last) = split(/\n/, $incomplete_split_info);
       unless($split_first =~ /^${incomplete_file}\.split_/) {
-        ERROR "No split files found, canceling resume";
+        ERROR "No split files found";
         ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
         die;
       }
       unless($split_first =~ /_[0-9]{5}$/) {
-        ERROR "Split was not created using numeric suffixes of length 5, canceling resume";
+        ERROR "Split was not created using numeric suffixes of length 5";
         ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
         die;
       }
@@ -1996,11 +2008,10 @@ sub btrfs_send_to_file($$$;$$)
       push @split_options, qw(-a 5), "--numeric-suffixes=${split_count}";
       $split_bytes = humansize_to_bytes($split);
       $source_offset_start = ($split_count - 1) * $split_bytes;
-      #DEBUG ">>${split_count}:${split_first}:${split_last}";die;
     }
     elsif(exists $incomplete_vol->{split}) {
       # Incomplete volume is split but split is disabled in the target's current config
-      ERROR "Split configuration has changed for raw target, canceling resume";
+      ERROR "Split configuration has changed for raw target";
       ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
       die;
     }
@@ -2016,7 +2027,7 @@ sub btrfs_send_to_file($$$;$$)
       die;
     }
     unless($verify->{file_size} > 0) {
-      ERROR "Incomplete file appears to be empty, canceling resume";
+      ERROR "Incomplete file appears to be empty";
       ERROR "Please delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
       die;
     }
@@ -2101,7 +2112,6 @@ sub btrfs_send_to_file($$$;$$)
       die;
     }
     if($incomplete_file && $ret =~ /^ERROR: DIGEST-VERIFICATION-FAILURE=/) {
-      # TODO: Auto-retry?
       ERROR "Incomplete file digest verification failed"
           . ($encrypt->{kdf_backend} ? " (Did you enter the correct passphrase?)" : '');
       ERROR "Please retry or delete stray subvolume (\"btrbk clean\"): $vol_received->{PRINT}";
@@ -3461,6 +3471,21 @@ sub config_key($$;@)
   $retval = $opts{prefix} . $retval if(defined($opts{prefix}) && defined($retval));
   $retval .= $opts{postfix} if(defined($opts{postfix}) && defined($retval));
   return $retval;
+}
+
+
+sub config_key_context($$)
+{
+  my $config = shift || die;
+  my $key = shift || die;
+  $config = $config->{CONFIG} if($config->{CONFIG});  # accept vinfo for $config
+  while(not exists($config->{$key})) {
+    # note: while all config keys exist in "meta" context (at least with default values),
+    #       we also allow fake configs (CONTEXT="cmdline") which have no PARENT.
+    return undef unless($config->{PARENT});
+    $config = $config->{PARENT};
+  }
+  return $config;
 }
 
 
@@ -6530,3 +6555,4 @@ MAIN:
 
 
 1;
+
