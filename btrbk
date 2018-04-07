@@ -32,7 +32,6 @@ use Carp qw(confess);
 use Getopt::Long qw(GetOptions);
 use Time::Local qw( timelocal timegm timegm_nocheck );
 use POSIX qw(floor);
-use Storable qw(dclone);
 use Math::BigFloat try => 'GMP';
 use Math::BigInt try => 'GMP';
 
@@ -2352,18 +2351,6 @@ sub system_read_raw_info_dir($)
     else {
       $raw_info->{RECEIVED_PARENT_UUID} = '-';
     }
-    if(defined $raw_info->{encrypt}) {
-      unless(($raw_info->{encrypt} eq 'openssl_enc') || ($raw_info->{encrypt} eq 'gpg')) {
-        ABORTED($droot, "Illegal \"encrypt\" in raw info file: " . $raw_info->{INFO_FILE});
-        return undef;
-      }
-      if($raw_info->{encrypt} eq 'openssl_enc') {
-        unless($raw_info->{cipher} && $raw_info->{iv}) {
-          ABORTED($droot, "Missing \"cipher\" or \"iv\" in raw info file: " . $raw_info->{INFO_FILE});
-          return undef;
-        }
-      }
-    }
   }
 
   DEBUG("Parsed " . @raw_targets . " raw info files in path: $droot->{PATH}");
@@ -2402,8 +2389,6 @@ sub system_read_raw_info_dir($)
         RECEIVED_PARENT_UUID => $+{parent_uuid} // '-',
         INCOMPLETE           => $+{incomplete} ? 1 : 0,
         encrypt              => $+{encrypt} // "",
-        openssl_cipher       => $+{cipher} // "",
-        openssl_iv           => $+{iv} // "",
         compress             => $+{compress} // "",
       };
       $deprecated_found++;
@@ -6555,4 +6540,3 @@ MAIN:
 
 
 1;
-
