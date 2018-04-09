@@ -1792,7 +1792,7 @@ sub btrfs_send_to_file($$$;$$)
     # Search for an existing incomplete info file on the target
     $incomplete_vol = vinfo_subvol($target, $target_filename);
     $incomplete_vol = undef unless(
-          (ref($incomplete_vol) eq 'HASH') &&
+          ref($incomplete_vol) &&
           exists($incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE}) &&
           $incomplete_vol->{node}->{BTRBK_RAW}->{INCOMPLETE} == 1
         );
