@@ -1,53 +1,12 @@
-#!/usr/bin/bash
-set -eu
-[ "${DEBUG:-0}" -gt 0 ] && set -x
+#!/usr/bin/dash
+# TODO: ^^^^^^^ Revert to /bin/sh
 
-_trap() { cb="$1"; shift; for s in "$@" ; do trap "$cb $s" "$s"; done }
+set -eu # exit on error, error on unset
+[ "${TRACE:-0}" -gt 0 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
-_SHUTDOWN_rm() {
-  for p in "$@"; do __shutdown_rm="$(printf '%s\001%s' "$p" "$__shutdown_rm")"; done
-  #for p in "$@"; do __shutdown_rm="${p}${__shutdown_rm+:${__shutdown_rm-}}"; done
-}
+_str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ;}
+_trap() { cb="$1"; shift; for s in "$@" ; do trap "$cb $s" "$s"; done ;}
 
-_SHUTDOWN() {
-  [ "${__shutdown_bypass-0}" -eq 1 ] && return
-  __shutdown_bypass=1
-  case "${1-}" in
-    INT|TERM) trap - INT TERM;;
-    EXIT) : ;;
-    *) _ERR "Invalid shutdown signal: $1" 0 127
-  esac
-  echo "==> SHUTDOWN: $1"
-  # Clean up
-  # ...
-}
-
-__shutdown_bypass=0
-__shutdown_rm=
-_trap '_SHUTDOWN' INT TERM EXIT
-
-_SHUTDOWN_rm /tmp/testa /tmp/testb* /tmp/testc
-
-x="${__shutdown_rm#*$(printf '\001')}"
-echo $x
-echo "${__shutdown_rm%*${x}}"
-exit
-
-IFS=':'
-set -f
-for p in "$__shutdown_rm"; do
-  echo ">>>$p"
-done
-
-#printf "$__shutdown_rm" | xargs -0 sh -c 'for f in "$@"; do echo "$f"; done'
-#echo "$__shutdown_rm" | while IFS= read -r -d ''; do echo $ln; done
-exit
-
-for p in "$(echo "$__shutdown_rm" | cut -d"$(printf '\001')")"; do
-  echo ">>$p"
-done
-
-exit
 _USAGE() {
   >&2 echo "$(basename "${0}"): <source-file> <dest-subvol>"
   exit 1
@@ -59,6 +18,45 @@ _ERR() {
   exit "${3:-1}"
 }
 
+_CLEANUP() (
+  set +e
+  list="${__cleanup_paths-}"
+  while [ "$list" != "${_list-}" ]; do
+    list="${_list:-${list}}"; _list="${list%${__cleanup_path_sep}*}"
+    val="${list#${_list}${__cleanup_path_sep}}"
+    rm "$val"
+  done
+)
+
+_SHUTDOWN() {
+  [ "${__shutdown_bypass-0}" -eq 1 ] && return
+  __shutdown_bypass=1
+  case "${1-}" in
+    INT|TERM) trap - INT TERM;;
+    EXIT) : ;;
+    *) _ERR "Invalid shutdown signal: $1" 0 127
+  esac
+  echo "==> SHUTDOWN: $1"
+  _CLEANUP
+}
+
+_add_cleanup_paths() {
+  : "${__cleanup_path_sep:="$(printf '\001')"}"
+  for p in "$@"; do
+    _str_contains "$p" "$__cleanup_path_sep" && _ERR 'Path contains list separator char'
+    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__cleanup_path_sep}}${p}"
+  done
+}
+
+_read_info_file() {
+  while IFS="=" read -r __k __v; do
+    case "$__k" in
+      '#'*) ;;
+      *) eval "__INFO__${__k}='${__v}'"
+    esac
+  done < "$1"
+}
+
 _checkbin() {
   if ! [ ${1+x} ]; then
     _ERR "not exists"
@@ -67,15 +65,10 @@ _checkbin() {
   fi
 }
 
-_read_info_file() {
-  while IFS="=" read -r key value; do
-    case "$key" in
-      '#'*) ;;
-      *)
-        eval "__INFO__$key=\"$value\""
-    esac
-  done < "$1"
-}
+_trap '_SHUTDOWN' INT TERM EXIT
+
+#_add_cleanup_paths /tmp/testa
+#_add_cleanup_paths /tmp/testb* /tmp/testc testd test/e test_f/oo/b"\014"ar
 
 bin_btrfs="$(command -v btrfs)"
 bin_dd="$(command -v dd)"
@@ -116,6 +109,7 @@ BUFFER_SIZE="${BUFFER_SIZE:-64MiB}"
 #: "${BUFFER_SIZE:=$((64 * 1024 * 1024))}"
 
 fifo="${source}.fifo~${$}"
+_add_cleanup_paths "$fifo"
 readpos=0
 
 "$bin_mkfifo" -m 0600 "$fifo"
