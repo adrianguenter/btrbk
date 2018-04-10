@@ -1,0 +1,200 @@
+#!/usr/bin/bash
+set -eu
+[ "${DEBUG:-0}" -gt 0 ] && set -x
+
+_trap() { cb="$1"; shift; for s in "$@" ; do trap "$cb $s" "$s"; done }
+
+_SHUTDOWN_rm() {
+  for p in "$@"; do __shutdown_rm="$(printf '%s\001%s' "$p" "$__shutdown_rm")"; done
+  #for p in "$@"; do __shutdown_rm="${p}${__shutdown_rm+:${__shutdown_rm-}}"; done
+}
+
+_SHUTDOWN() {
+  [ "${__shutdown_bypass-0}" -eq 1 ] && return
+  __shutdown_bypass=1
+  case "${1-}" in
+    INT|TERM) trap - INT TERM;;
+    EXIT) : ;;
+    *) _ERR "Invalid shutdown signal: $1" 0 127
+  esac
+  echo "==> SHUTDOWN: $1"
+  # Clean up
+  # ...
+}
+
+__shutdown_bypass=0
+__shutdown_rm=
+_trap '_SHUTDOWN' INT TERM EXIT
+
+_SHUTDOWN_rm /tmp/testa /tmp/testb* /tmp/testc
+
+x="${__shutdown_rm#*$(printf '\001')}"
+echo $x
+echo "${__shutdown_rm%*${x}}"
+exit
+
+IFS=':'
+set -f
+for p in "$__shutdown_rm"; do
+  echo ">>>$p"
+done
+
+#printf "$__shutdown_rm" | xargs -0 sh -c 'for f in "$@"; do echo "$f"; done'
+#echo "$__shutdown_rm" | while IFS= read -r -d ''; do echo $ln; done
+exit
+
+for p in "$(echo "$__shutdown_rm" | cut -d"$(printf '\001')")"; do
+  echo ">>$p"
+done
+
+exit
+_USAGE() {
+  >&2 echo "$(basename "${0}"): <source-file> <dest-subvol>"
+  exit 1
+}
+
+_ERR() {
+  >&2 echo "ERROR: ${1}"
+  [ "${2:-0}" -eq 1 ] && { echo; _USAGE; }
+  exit "${3:-1}"
+}
+
+_checkbin() {
+  if ! [ ${1+x} ]; then
+    _ERR "not exists"
+  elif ! [ -x "$1" ]; then
+    _ERR "$1 is not executable"
+  fi
+}
+
+_read_info_file() {
+  while IFS="=" read -r key value; do
+    case "$key" in
+      '#'*) ;;
+      *)
+        eval "__INFO__$key=\"$value\""
+    esac
+  done < "$1"
+}
+
+bin_btrfs="$(command -v btrfs)"
+bin_dd="$(command -v dd)"
+bin_fallocate="$(command -v fallocate)"
+bin_findmnt="$(command -v findmnt)"
+bin_gpg="$(command -v gpg)"
+bin_mkfifo="$(command -v mkfifo)"
+bin_openssl="$(command -v openssl)"
+bin_stat="$(command -v stat)"
+
+source="${1-}"
+source_info="${1-}.info"
+destination="${2-}"
+
+# Source check
+if [ -z "$source" ]; then
+  _ERR "Raw backup file was not specified" 1
+elif ! [ -r "$source" ]; then
+  _ERR "Raw backup file doesn't exist or isn't readable: ${source}"
+elif ! [ -r "$source_info" ]; then
+  _ERR "Sidecar info file doesn't exist or isn't readable: ${source_info}"
+fi
+
+_read_info_file "$source_info"
+
+source_size=$("$bin_stat" -c%s "$source")
+
+if [ "${__INFO__INCOMPLETE-0}" -eq 1 ]; then
+  _ERR "Raw backup file is marked incomplete"
+elif [ "$source_size" -eq 0 ]; then
+  _ERR "Source file appears empty (size is 0 bytes)"
+fi
+
+# Destination check
+echo "$destination"
+
+BUFFER_SIZE="${BUFFER_SIZE:-64MiB}"
+#: "${BUFFER_SIZE:=$((64 * 1024 * 1024))}"
+
+fifo="${source}.fifo~${$}"
+readpos=0
+
+"$bin_mkfifo" -m 0600 "$fifo"
+
+dd if=/dev/zero bs=1M count=1024 >$fifo &
+dd of=/dev/null <$fifo
+
+exit
+
+_checkbin dd
+
+echo $bin_findmnt
+
+rm -rf read-delete-test/
+
+mkdir read-delete-test
+
+#infile=read-delete-test/a
+infile=read-delete.dat
+outfile=read-delete-test/b
+fifo=read-delete-test/fifo
+
+infile_fs=$(Findmnt -n -o FSTYPE --target)
+echo $infile_fs
+exit
+
+#dd if=/dev/urandom of=$infile bs=1M count=1841129875 iflag=count_bytes
+
+#tail -c1M $infile | sha256sum
+
+filesize=$(stat -c%s "$infile")
+readsize=$((64 * 1024 * 1024))
+readpos=0
+
+mkfifo -m 0600 $fifo
+
+dd if=/dev/zero bs=1M count=1024 >$fifo &
+dd of=/dev/null <$fifo
+
+echo "done"
+
+exit
+
+{
+  while : ; do
+    #echo "Read from: $readpos"
+    dd status=none if=$infile bs=1M skip=$readpos count=$readsize iflag=count_bytes,skip_bytes >&3
+    #echo "fallocate"
+    #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
+    readpos=$((readpos + readsize))
+    [ $readpos -lt $filesize ] || { >&2 echo "DONE"; break; }
+  done
+} &
+
+echo "Read FIFO"
+dd status=none bs=1M if=$fifo of=$outfile #count=$filesize iflag=count_bytes
+
+#echo "Digest outfile"
+#tail -c1M $outfile | sha256sum
+
+#du -k read-delete-test/
+
+
+exit
+
+
+#dd status=none if=$testfile bs=1M skip=43G iflag=skip_bytes | sha256sum
+#time fallocate -p -o 0 -l43G $testfile
+#btrfs fi du $testfile
+#dd status=none if=$testfile bs=1M skip=43G iflag=skip_bytes | sha256sum
+
+for i in $(seq 0 9); do
+  dd if=$testfile bs=1M count=1M iflag=count_bytes,skip_bytes,fullblock >> $testfile.dup
+  cut -b 1048576- $testfile
+  #dd if=$testfile bs=1M count=1M skip=${i}M iflag=count_bytes,skip_bytes,fullblock >> $testfile.dup  
+done
+
+ls -alF $testfile $testfile.dup
+
+sha256sum $testfile $testfile.dup
+
+rm $testfile $testfile.dup
