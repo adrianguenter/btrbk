@@ -2,15 +2,17 @@
 # TODO: ^^^^^^^ Revert to /bin/sh
 
 set -eu # exit on error, error on unset
-[ "${TRACE:-0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
+[ "${TRACE:=0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
-[ "${INPLACE:-0}" ] # INPLACE=1 btrbk-restore-raw ...
+: "${INPLACE:=0}" # INPLACE=1 btrbk-restore-raw ...
+
+: "${BUFFER_SIZE:=$((64 * 1024 * 1024))}" # BUFFER_SIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 
 _str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ; }
 _trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
 
 _USAGE() {
-  >&2 echo "usage: [INPLACE=1|0] [TRACE=1|0] $(basename "${0}") <source-file> <dest-subvol>\n"
+  >&2 echo "usage: [INPLACE=1|0] [TRACE=1|0] $(basename "${0}") <info-file> <dest-subvol>\n"
   >&2 echo "Environment variables:"
   >&2 echo "\nINPLACE  1: Incrementally truncate the head of the source file (fallocate --punch-hole) as its read"
   >&2 echo "            === WARNING ==="
@@ -39,8 +41,8 @@ _DEPENDENCY_ERR() {
 _CLEANUP() (
   set +e
   __l="${__cleanup_paths-}"; while [ "$__l" != "${__l2-}" ]; do
-    __l="${__l2:-${__l}}"; __l2="${__l%${__cleanup_path_sep}*}"
-    __v="${__l#${__l2}${__cleanup_path_sep}}"
+    __l="${__l2:-${__l}}"; __l2="${__l%${__file_path_sep}*}"
+    __v="${__l#${__l2}${__file_path_sep}}"
     rm "$__v"
   done; unset __l __l2 __v
 )
@@ -58,83 +60,130 @@ _SHUTDOWN() {
 }
 
 _add_cleanup_paths() {
-  : "${__cleanup_path_sep:="$(printf '\001')"}"
+  : "${__file_path_sep:="$(printf '\001')"}"
   for __p in "$@"; do
-    _str_contains "$__p" "$__cleanup_path_sep" && _ERR 'Path contains list separator char'
-    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__cleanup_path_sep}}${__p}"
+    _str_contains "$__p" "$__file_path_sep" && _ERR 'Path contains list separator char'
+    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__file_path_sep}}${__p}"
   done; unset __p
 }
 
 _load_info_file() {
-  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __RAWINFO__
-  while IFS="=" read -r __k __v; do
-    case "$__k" in
-      '#'*) ;;
-      *) eval "__RAWINFO__${__k}='${__v}'"
+  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
+  {
+    read -r __v; case "$__v" in
+      '#btrbk-'*) ;;
+      *) _ERR "Info (sidecar) file does not start with a #btrbk-v\${VERSION} line"
     esac
-  done < "$1"; unset __k __v
+    while IFS="=" read -r __k __v; do
+      case "$__k" in
+        '') ;;
+        '#'*) ;;
+        *) eval "__INFOFILE__${__k}='${__v}'"
+      esac
+    done
+  } < "$1"; unset __k __v
 }
 
-_checkbin() {
-  if ! [ ${1+x} ]; then
-    _ERR "not exists"
-  elif ! [ -x "$1" ]; then
-    _ERR "$1 is not executable"
-  fi
-}
+_require_bin() { __p="$(command -v "$1" ||:)"; eval alias "${1}='${__p}'"; [ -n "$__p" ] || _DEPENDENCY_ERR "$1" "$2"; unset __p; }
 
 _trap _SHUTDOWN INT TERM EXIT
 
 # Required dependencies
-bin_btrfs="$(command -v btrfs)" || _DEPENDENCY_ERR btrfs btrfs-progs
-bin_dd="$(command -v dd)"       || _DEPENDENCY_ERR dd    coreutils
-bin_stat="$(command -v stat)"   || _DEPENDENCY_ERR stat  coreutils
-
-# Optional dependencies
-bin_fallocate="$(command -v fallocate)"
-bin_findmnt="$(command -v findmnt)"
-bin_gpg="$(command -v gpg)"
-bin_mkfifo="$(command -v mkfifo)"
-bin_openssl="$(command -v openssl)"
+_require_bin btrfs    btrfs-progs
+_require_bin basename coreutils
+_require_bin dirname  coreutils
+_require_bin dd       coreutils
+_require_bin mkfifo   coreutils
+_require_bin readlink coreutils
+_require_bin stat     coreutils
+if [ "$INPLACE" -eq 1 ]; then
+  _require_bin findmnt  util-linux
+fi
 
 # Script arguments
-source="${1-}"
-source_info="${1-}.info"
+source_info="${1-}"
 destination="${2-}"
 
 # Source check
-if [ -z "$source" ]; then
-  _ERR "Raw backup file was not specified" 1
-elif ! [ -r "$source" ]; then
-  _ERR "Raw backup file doesn't exist or isn't readable: ${source}"
+if [ -z "$source_info" ]; then
+  _ERR "Info (sidecar) file was not specified" 1
 elif ! [ -r "$source_info" ]; then
-  _ERR "Sidecar info file doesn't exist or isn't readable: ${source_info}"
+  _ERR "Info (sidecar) file doesn't exist or isn't readable: ${source_info}"
 fi
+
+source_dir="$(dirname "$(readlink -f "$source_info")")"
+
+source_info="${source_dir}/${source_info##*/}" # Canonicalize
 
 _load_info_file "$source_info"
 
-source_size=$("$bin_stat" -c%s "$source")
+source="${source_dir}/${__INFOFILE__FILE##*/}"
 
-if [ "${__INFO__INCOMPLETE-0}" -eq 1 ]; then
+if [ "${__INFOFILE__INCOMPLETE-0}" -eq 1 ]; then
   _ERR "Raw backup file is marked incomplete"
-elif [ "$source_size" -eq 0 ]; then
-  _ERR "Source file appears empty (size is 0 bytes)"
 fi
 
-# Destination check
+if [ -n "${__INFOFILE__split+x}" ]; then
+  source_glob="${source}.split_*"
+# .split_
+fi
+
+file_list=${source_glob:-$source}
+
+# Source sanity checks and preliminary info gathering
+total_size=0
+for f in $file_list; do
+  # Attempt capturing the filesystem name which houses the source file(s) to test for fallocate --punch-hole compat
+  [ "$INPLACE" -eq 1 ] && "${source_fs:="$(findmnt -n -o FSTYPE --target "$f")"}"
+  [ -r "$f" ] || _ERR "File doesn't exist or isn't readable: ${f}"
+  fsize="$(stat -c%s "$f")"
+  [ "$fsize" -gt 0 ] || _ERR "Source file appears empty (size is 0 bytes): ${f}"
+  total_size=$(($total_size + $fsize))
+done
+
+# Destination sanity checks
 echo "$destination"
 
-BUFFER_SIZE="${BUFFER_SIZE:-64MiB}"
-#: "${BUFFER_SIZE:=$((64 * 1024 * 1024))}"
-
+# Main
 fifo="${source}.fifo~${$}"
+mkfifo -m 0600 "$fifo"
 _add_cleanup_paths "$fifo"
-readpos=0
 
-"$bin_mkfifo" -m 0600 "$fifo"
+if [ "$INPLACE" -eq 1 ]; then
+  # TODO ASK FOR CONFIRMATION!
+  >&2 echo "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
+  trap - INT
+fi
 
-# MAIN BODY SEQ
-# * ? unsplit
+exec 3<> "$fifo"
+{
+  for f in $file_list; do
+    readpos=0
+    fsize="$(stat -c%s "$f")"
+    while : ; do
+      #echo "Read from: $readpos"
+      dd status=none if=$f bs=1M skip=$readpos count=$BUFFER_SIZE iflag=count_bytes,skip_bytes >"$fifo"
+      #echo "fallocate"
+      #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
+      readpos=$(($readpos + $BUFFER_SIZE))
+      [ $readpos -lt $fsize ] || { >&2 echo "DONE: ${f}"; break; }
+    done; sleep 1
+  done
+} & read_pid=$!
+
+#outfile=/tmp/btrbk-restore.out # TODO Remove
+#dd status=none bs=1M count="$total_size" iflag=count_bytes of="$outfile" <"$fifo" & write_pid=$!
+
+# Need dd here or btrfs receive blocks forever at end like dd does without count (how to fix this fifo EOF issue?)
+< "$fifo" dd status=none bs=1M count="$total_size" iflag=count_bytes | btrfs receive -v "$destination" & write_pid=$!
+
+wait $read_pid $write_pid
+
+exit
+
+##### MAIN BODY SEQ
+# * ? unsplit DONE
+#   - loop split files for easy truncation (recalc filesize for each)
 # * ? unencrypt
 #   - openssl
 #     - keyfile
@@ -147,73 +196,3 @@ readpos=0
 # FIFO usage w/ dd:
 # dd if=/dev/zero bs=1M count=1024 >$fifo &
 # dd of=/dev/null <$fifo
-
-rm -rf read-delete-test/
-
-mkdir read-delete-test
-
-#infile=read-delete-test/a
-infile=read-delete.dat
-outfile=read-delete-test/b
-fifo=read-delete-test/fifo
-
-infile_fs=$(Findmnt -n -o FSTYPE --target)
-echo $infile_fs
-exit
-
-#dd if=/dev/urandom of=$infile bs=1M count=1841129875 iflag=count_bytes
-
-#tail -c1M $infile | sha256sum
-
-filesize=$(stat -c%s "$infile")
-readsize=$((64 * 1024 * 1024))
-readpos=0
-
-mkfifo -m 0600 $fifo
-
-dd if=/dev/zero bs=1M count=1024 >$fifo &
-dd of=/dev/null <$fifo
-
-echo "done"
-
-exit
-
-{
-  while : ; do
-    #echo "Read from: $readpos"
-    dd status=none if=$infile bs=1M skip=$readpos count=$readsize iflag=count_bytes,skip_bytes >&3
-    #echo "fallocate"
-    #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
-    readpos=$((readpos + readsize))
-    [ $readpos -lt $filesize ] || { >&2 echo "DONE"; break; }
-  done
-} &
-
-echo "Read FIFO"
-dd status=none bs=1M if=$fifo of=$outfile #count=$filesize iflag=count_bytes
-
-#echo "Digest outfile"
-#tail -c1M $outfile | sha256sum
-
-#du -k read-delete-test/
-
-
-exit
-
-
-#dd status=none if=$testfile bs=1M skip=43G iflag=skip_bytes | sha256sum
-#time fallocate -p -o 0 -l43G $testfile
-#btrfs fi du $testfile
-#dd status=none if=$testfile bs=1M skip=43G iflag=skip_bytes | sha256sum
-
-for i in $(seq 0 9); do
-  dd if=$testfile bs=1M count=1M iflag=count_bytes,skip_bytes,fullblock >> $testfile.dup
-  cut -b 1048576- $testfile
-  #dd if=$testfile bs=1M count=1M skip=${i}M iflag=count_bytes,skip_bytes,fullblock >> $testfile.dup  
-done
-
-ls -alF $testfile $testfile.dup
-
-sha256sum $testfile $testfile.dup
-
-rm $testfile $testfile.dup
