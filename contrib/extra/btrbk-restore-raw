@@ -2,13 +2,26 @@
 # TODO: ^^^^^^^ Revert to /bin/sh
 
 set -eu # exit on error, error on unset
-[ "${TRACE:-0}" -gt 0 ] && set -x # TRACE=1 btrbk-restore-raw ...
+[ "${TRACE:-0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
-_str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ;}
-_trap() { cb="$1"; shift; for s in "$@" ; do trap "$cb $s" "$s"; done ;}
+[ "${INPLACE:-0}" ] # INPLACE=1 btrbk-restore-raw ...
+
+_str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ; }
+_trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
 
 _USAGE() {
-  >&2 echo "$(basename "${0}"): <source-file> <dest-subvol>"
+  >&2 echo "usage: [INPLACE=1|0] [TRACE=1|0] $(basename "${0}") <source-file> <dest-subvol>\n"
+  >&2 echo "Environment variables:"
+  >&2 echo "\nINPLACE  1: Incrementally truncate the head of the source file (fallocate --punch-hole) as its read"
+  >&2 echo "            === WARNING ==="
+  >&2 echo "            THIS OPTION DESTROYS THE RAW BACKUP SOURCE FILE"
+  >&2 echo "            If the restore operation fails for any reason the file will be PERMANENTLY CORRUPTED!"
+  >&2 echo "            Only use this if absolutely necessary -- e.g., source and target are on the same filesystem"
+  >&2 echo "            and space is at a premium. ENSURE THAT YOU HAVE ANOTHER COPY OF THIS BACKUP OR CAN AFFORD TO"
+  >&2 echo "            LOSE THE DATA! YOU HAVE BEEN WARNED"
+  >&2 echo "         0: (Default) Do not modify the raw backup source file"
+  >&2 echo "\nTRACE    1: Print shell trace output"
+  >&2 echo "         0: (Default) Disable shell trace output"
   exit 1
 }
 
@@ -18,14 +31,18 @@ _ERR() {
   exit "${3:-1}"
 }
 
+_DEPENDENCY_ERR() {
+  >&2 printf 'ERROR: "%s" not found in $PATH%s\n' "$1" "${2:+"; is the \"${2}\" package (or equivalent) installed?"}"
+  exit 9
+}
+
 _CLEANUP() (
   set +e
-  list="${__cleanup_paths-}"
-  while [ "$list" != "${_list-}" ]; do
-    list="${_list:-${list}}"; _list="${list%${__cleanup_path_sep}*}"
-    val="${list#${_list}${__cleanup_path_sep}}"
-    rm "$val"
-  done
+  __l="${__cleanup_paths-}"; while [ "$__l" != "${__l2-}" ]; do
+    __l="${__l2:-${__l}}"; __l2="${__l%${__cleanup_path_sep}*}"
+    __v="${__l#${__l2}${__cleanup_path_sep}}"
+    rm "$__v"
+  done; unset __l __l2 __v
 )
 
 _SHUTDOWN() {
@@ -42,19 +59,20 @@ _SHUTDOWN() {
 
 _add_cleanup_paths() {
   : "${__cleanup_path_sep:="$(printf '\001')"}"
-  for p in "$@"; do
-    _str_contains "$p" "$__cleanup_path_sep" && _ERR 'Path contains list separator char'
-    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__cleanup_path_sep}}${p}"
-  done
+  for __p in "$@"; do
+    _str_contains "$__p" "$__cleanup_path_sep" && _ERR 'Path contains list separator char'
+    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__cleanup_path_sep}}${__p}"
+  done; unset __p
 }
 
-_read_info_file() {
+_load_info_file() {
+  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __RAWINFO__
   while IFS="=" read -r __k __v; do
     case "$__k" in
       '#'*) ;;
-      *) eval "__INFO__${__k}='${__v}'"
+      *) eval "__RAWINFO__${__k}='${__v}'"
     esac
-  done < "$1"
+  done < "$1"; unset __k __v
 }
 
 _checkbin() {
@@ -65,20 +83,21 @@ _checkbin() {
   fi
 }
 
-_trap '_SHUTDOWN' INT TERM EXIT
+_trap _SHUTDOWN INT TERM EXIT
 
-#_add_cleanup_paths /tmp/testa
-#_add_cleanup_paths /tmp/testb* /tmp/testc testd test/e test_f/oo/b"\014"ar
+# Required dependencies
+bin_btrfs="$(command -v btrfs)" || _DEPENDENCY_ERR btrfs btrfs-progs
+bin_dd="$(command -v dd)"       || _DEPENDENCY_ERR dd    coreutils
+bin_stat="$(command -v stat)"   || _DEPENDENCY_ERR stat  coreutils
 
-bin_btrfs="$(command -v btrfs)"
-bin_dd="$(command -v dd)"
+# Optional dependencies
 bin_fallocate="$(command -v fallocate)"
 bin_findmnt="$(command -v findmnt)"
 bin_gpg="$(command -v gpg)"
 bin_mkfifo="$(command -v mkfifo)"
 bin_openssl="$(command -v openssl)"
-bin_stat="$(command -v stat)"
 
+# Script arguments
 source="${1-}"
 source_info="${1-}.info"
 destination="${2-}"
@@ -92,7 +111,7 @@ elif ! [ -r "$source_info" ]; then
   _ERR "Sidecar info file doesn't exist or isn't readable: ${source_info}"
 fi
 
-_read_info_file "$source_info"
+_load_info_file "$source_info"
 
 source_size=$("$bin_stat" -c%s "$source")
 
@@ -114,14 +133,20 @@ readpos=0
 
 "$bin_mkfifo" -m 0600 "$fifo"
 
-dd if=/dev/zero bs=1M count=1024 >$fifo &
-dd of=/dev/null <$fifo
+# MAIN BODY SEQ
+# * ? unsplit
+# * ? unencrypt
+#   - openssl
+#     - keyfile
+#     - kdf
+#   - gpg
+# * ? uncompress
+#   - xz
+#   - gzip
 
-exit
-
-_checkbin dd
-
-echo $bin_findmnt
+# FIFO usage w/ dd:
+# dd if=/dev/zero bs=1M count=1024 >$fifo &
+# dd of=/dev/null <$fifo
 
 rm -rf read-delete-test/
 
