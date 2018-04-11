@@ -2123,10 +2123,11 @@ sub btrfs_send_to_file($$$;$$)
     # can not rely on the exit status of the command pipe, and a shell
     # redirection as well as "dd" always creates the target file.
     # Note that "split" does not create empty files.
-    my $test_postfix = ($split ? ".split_*" : "");
+    my $test_postfix = $split ? (".split_" . ($do_resume_incomplete ? "00000" : "aa")) : "";
     DEBUG "Testing target data file (non-zero size)";
     $ret = run_cmd({
-      cmd  => ['test', '-s', { unsafe => "${target_path}/${target_filename}${test_postfix}" } ],
+      cmd  => [ 'test', '-s', "${target_path}/${target_filename}${test_postfix}" ],
+      check_unsafe => [ { unsafe => "${target_path}/${target_filename}" } ],
       rsh  => vinfo_rsh($target),
       name => "test",
     });
