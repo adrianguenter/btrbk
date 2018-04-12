@@ -4,6 +4,8 @@
 set -eu # exit on error, error on unset
 [ "${TRACE:=0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
+: "${TESTRUN:=0}" # TESTRUN=1 btrbk-restore-raw ...
+
 : "${INPLACE:=0}" # INPLACE=1 btrbk-restore-raw ...
 
 : "${BUFFER_SIZE:=$((64 * 1024 * 1024))}" # BUFFER_SIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
@@ -12,20 +14,33 @@ _str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ; }
 _trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
 
 _USAGE() {
-  >&2 echo "usage: [INPLACE=1|0] [TRACE=1|0] $(basename "${0}") <info-file> <dest-subvol>\n"
-  >&2 echo "Environment variables:"
-  >&2 echo "\nINPLACE  1: Incrementally truncate the head of the source file (fallocate --punch-hole) as its read"
-  >&2 echo "            === WARNING ==="
-  >&2 echo "            THIS OPTION DESTROYS THE RAW BACKUP SOURCE FILE"
-  >&2 echo "            If the restore operation fails for any reason the file will be PERMANENTLY CORRUPTED!"
-  >&2 echo "            Only use this if absolutely necessary -- e.g., source and target are on the same filesystem"
-  >&2 echo "            and space is at a premium. ENSURE THAT YOU HAVE ANOTHER COPY OF THIS BACKUP OR CAN AFFORD TO"
-  >&2 echo "            LOSE THE DATA! YOU HAVE BEEN WARNED"
-  >&2 echo "         0: (Default) Do not modify the raw backup source file"
-  >&2 echo "\nTRACE    1: Print shell trace output"
-  >&2 echo "         0: (Default) Disable shell trace output"
+  >&2 printf \
+'usage: [TESTRUN=1] [BLOCKSIZE=<bytes>] [INPLACE=1] [TRACE=1] %s <info-file> <target-subvol>
+
+Environment variables:
+
+TESTRUN=1  Perform a test run of BLOCKSIZE bytes (disables INPLACE)
+
+BLOCKSIZE=<bytes>  Set the amount of bytes read (and truncated, if INPLACE) at a time
+                   Note that shell arithmetic $((...)) can be used to calculate values, for example
+                   BLOCKSIZE=$((64 * 1024 * 1024)) sets the value to 67108864 (64MiB), the default
+
+INPLACE=1  Truncate the head of the source raw backup file (fallocate --punch-hole) as its read;
+           a mandatory test run will automatically be performed and must complete successfully
+           === WARNING ===
+           THIS OPTION DESTROYS THE RAW BACKUP SOURCE FILE -- ENSURE THAT YOU HAVE ANOTHER COPY
+           OF THE SNAPSHOT OR CAN AFFORD TO LOSE THE DATA BEFORE ENABLING THIS OPTION!
+           If the restore operation fails for any reason the file will be PERMANENTLY CORRUPTED,
+           so only use if absolutely necessary; e.g. the backup file and target are on the same
+           btrfs filesystem and the space used by the file is needed to restore the subvolume
+
+TRACE=1    Enable shell trace output
+
+' "$(basename "${0}")"
   exit 1
 }
+
+# TODO TESTRUN make sure key can decrypt, or passphrase is correct, all utilities work, etc before INPLACE destructive read
 
 _ERR() {
   >&2 echo "ERROR: ${1}"
@@ -102,7 +117,7 @@ fi
 
 # Script arguments
 source_info="${1-}"
-destination="${2-}"
+target="${2-}"
 
 # Source check
 if [ -z "$source_info" ]; then
@@ -141,8 +156,8 @@ for f in $file_list; do
   total_size=$(($total_size + $fsize))
 done
 
-# Destination sanity checks
-echo "$destination"
+# Target sanity checks
+echo "$target"
 
 # Main
 fifo="${source}.fifo~${$}"
@@ -175,7 +190,7 @@ exec 3<> "$fifo"
 #dd status=none bs=1M count="$total_size" iflag=count_bytes of="$outfile" <"$fifo" & write_pid=$!
 
 # Need dd here or btrfs receive blocks forever at end like dd does without count (how to fix this fifo EOF issue?)
-< "$fifo" dd status=none bs=1M count="$total_size" iflag=count_bytes | btrfs receive -v "$destination" & write_pid=$!
+< "$fifo" dd status=none bs=1M count="$total_size" iflag=count_bytes | btrfs receive -v "$target" & write_pid=$!
 
 wait $read_pid $write_pid
 
