@@ -8,7 +8,7 @@ set -eu # exit on error, error on unset
 
 : "${INPLACE:=0}" # INPLACE=1 btrbk-restore-raw ...
 
-: "${BUFFER_SIZE:=$((64 * 1024 * 1024))}" # BUFFER_SIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
+: "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 
 _str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ; }
 _trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
@@ -84,6 +84,9 @@ _add_cleanup_paths() {
 
 _load_info_file() {
   # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
+  if [ "${1#${1%.info}}"_ != '.info'_ ]; then
+    >&2 echo "WARNING: Expected argument 1 (sidecar info file) to have an extension of \".info\": ${1}"
+  fi
   {
     read -r __v; case "$__v" in
       '#btrbk-'*) ;;
@@ -99,7 +102,72 @@ _load_info_file() {
   } < "$1"; unset __k __v
 }
 
-_require_bin() { __p="$(command -v "$1" ||:)"; eval alias "${1}='${__p}'"; [ -n "$__p" ] || _DEPENDENCY_ERR "$1" "$2"; unset __p; }
+run() {
+  __source_list="$1"
+  __total_bytes="$2"
+  __target="$3"
+  __block_size="${4:-BLOCKSIZE}"
+  __source_destroy="${5:-0}"
+  # TODO Rename fifo to __fifo or remove altogether depending on benchmark result
+  #fifo="${source}.fifo~${$}"
+  #mkfifo -m 0600 "$fifo"
+  #_add_cleanup_paths "$fifo"
+
+  # TODO Does this belong here or below in main? (Prob. the latter)
+  if [ "$INPLACE" -eq 1 ]; then
+    # TODO ASK FOR CONFIRMATION!
+    >&2 echo "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
+    trap - INT
+  fi
+
+  #exec 3<> "$fifo"
+  {
+    __read_bytes=0
+    __remaining_bytes="$__total_bytes"
+    for __f in $__source_list; do
+      __f_size="$(\stat -c%s "$__f")"
+      __f_remaining_bytes="$__f_size"
+      __f_pos=0
+      __dd_bytes="$__block_size"
+      while : ; do
+        [ $__remaining_bytes -gt 0 ] || break
+        [ $__f_remaining_bytes -gt 0 ] || break
+
+        [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
+        [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
+
+        #echo "Read from: $__rpos"
+        \dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes #>"$fifo"
+
+        __f_pos=$(($__f_pos + $__dd_bytes))
+        __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
+        __read_bytes=$(($__read_bytes + $__dd_bytes))
+        __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
+        #echo "fallocate"
+        #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
+        break # TODO REMOVE
+      done
+      >&2 echo "FILE DONE: ${__f}"
+    done
+    >&2 echo "READ DONE"
+  } \
+    | btrfs receive -v /dev/null; echo ">>>${?}" # "$__target"
+  #} & __r_pid=$!
+
+  #outfile=/tmp/btrbk-restore.out # TODO Remove
+  #dd status=none bs=1M count="$total_size" iflag=count_bytes of="$outfile" <"$fifo" & write_pid=$!
+
+  # Need dd here or btrfs receive blocks forever at end like dd does without count (how to fix this fifo EOF issue?)
+  #< "$fifo" dd status=none bs=1M count="$__total_bytes" iflag=count_bytes | btrfs receive -v "$__target" & __w_pid=$!
+
+  #wait $__r_pid $__w_pid
+}
+
+_require_bin() { __p="$(command -v "$1" ||:)" ;
+  # Ensure that $__p is absolute and ends in "/<command_name>"
+  [ "${__p%${__p#?}}${__p#${__p%/${1}}}" = "//${1}" ] || _DEPENDENCY_ERR "$1" "$2"
+unset __p; }
+
 
 _trap _SHUTDOWN INT TERM EXIT
 
@@ -132,7 +200,11 @@ source_info="${source_dir}/${source_info##*/}" # Canonicalize
 
 _load_info_file "$source_info"
 
-source="${source_dir}/${__INFOFILE__FILE##*/}"
+source_name="${__INFOFILE__FILE##*/}"
+
+subvol_name="${source_name%.btrfs*}"
+
+source="${source_dir}/${source_name}"
 
 if [ "${__INFOFILE__INCOMPLETE-0}" -eq 1 ]; then
   _ERR "Raw backup file is marked incomplete"
@@ -157,42 +229,23 @@ for f in $file_list; do
 done
 
 # Target sanity checks
-echo "$target"
-
-# Main
-fifo="${source}.fifo~${$}"
-mkfifo -m 0600 "$fifo"
-_add_cleanup_paths "$fifo"
-
-if [ "$INPLACE" -eq 1 ]; then
-  # TODO ASK FOR CONFIRMATION!
-  >&2 echo "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
-  trap - INT
+if [ -e "${target}/${subvol_name}" ]; then
+  _ERR "Restore target exists, aborting: ${target}/${subvol_name}"
 fi
 
-exec 3<> "$fifo"
-{
-  for f in $file_list; do
-    readpos=0
-    fsize="$(stat -c%s "$f")"
-    while : ; do
-      #echo "Read from: $readpos"
-      dd status=none if=$f bs=1M skip=$readpos count=$BUFFER_SIZE iflag=count_bytes,skip_bytes >"$fifo"
-      #echo "fallocate"
-      #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
-      readpos=$(($readpos + $BUFFER_SIZE))
-      [ $readpos -lt $fsize ] || { >&2 echo "DONE: ${f}"; break; }
-    done; sleep 1
-  done
-} & read_pid=$!
+set +e; target_info="$(btrfs sub show "$target")"; set -e
+[ $? -eq 0 ] || target_info=
 
-#outfile=/tmp/btrbk-restore.out # TODO Remove
-#dd status=none bs=1M count="$total_size" iflag=count_bytes of="$outfile" <"$fifo" & write_pid=$!
+if [ -z "$target_info" ]; then
+  _ERR "Restore target does not appear to be a btrfs subvolume (\"btrfs show '${target}'\" failed)"
+fi
 
-# Need dd here or btrfs receive blocks forever at end like dd does without count (how to fix this fifo EOF issue?)
-< "$fifo" dd status=none bs=1M count="$total_size" iflag=count_bytes | btrfs receive -v "$target" & write_pid=$!
+if echo "$target_info" | grep Flags: | grep -q readonly; then
+  _ERR "Restore target appears to be readonly: ${target}"
+fi
 
-wait $read_pid $write_pid
+# Main
+run "$file_list" $total_size "$target" "$BLOCKSIZE" 0
 
 exit
 
