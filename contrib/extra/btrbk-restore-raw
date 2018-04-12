@@ -10,7 +10,7 @@ set -eu # exit on error, error on unset
 
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 
-_echo() { if [ $# -lt 2 ]; then; printf '%s\n' "${1-}"; else; __s=; for __a in "$@"; do __s="$__s $__a"; done; printf '%s\n' "$__s"; unset __a __s; fi }
+_echo() { if [ $# -lt 2 ]; then printf '%s\n' "${1-}"; else __s=; for __a in "$@"; do __s="$__s $__a"; done; printf '%s\n' "$__s"; unset __a __s; fi }
 _errecho() { >&2 _echo "$@"; }
 _str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ] ; }
 _trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
@@ -47,7 +47,7 @@ TRACE=1    Enable shell trace output
 
 _ERR() {
   _errecho 'ERROR: ' "$@"
-  [ "${2:-0}" -eq 1 ] && { _errecho; USAGE }
+  [ "${2:-0}" -eq 1 ] && { _errecho; USAGE; }
   exit "${3:-1}"
 }
 
@@ -238,7 +238,7 @@ reconstruct_source "$file_list" $total_size "$toolchain" "$BLOCKSIZE" 0 \
 exit 0
 
 ##### TODO
- * ? unencrypt
+# * ? unencrypt
 #   - openssl
 #     - keyfile
 #     - kdf
