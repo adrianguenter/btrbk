@@ -10,7 +10,9 @@ set -eu # exit on error, error on unset
 
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 
-_str_contains() { [ -n "$1" ] && [ -z "${1##*$2*}" ] || [ -z "$2" ] ; }
+_echo() { if [ $# -lt 2 ]; then; printf '%s\n' "${1-}"; else; __s=; for __a in "$@"; do __s="$__s $__a"; done; printf '%s\n' "$__s"; unset __a __s; fi }
+_errecho() { >&2 _echo "$@"; }
+_str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ] ; }
 _trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
 
 _USAGE() {
@@ -42,9 +44,10 @@ TRACE=1    Enable shell trace output
 
 # TODO TESTRUN make sure key can decrypt, or passphrase is correct, all utilities work, etc before INPLACE destructive read
 
+
 _ERR() {
-  >&2 echo "ERROR: ${1}"
-  [ "${2:-0}" -eq 1 ] && { echo; _USAGE; }
+  _errecho 'ERROR: ' "$@"
+  [ "${2:-0}" -eq 1 ] && { _errecho; USAGE }
   exit "${3:-1}"
 }
 
@@ -70,7 +73,7 @@ _SHUTDOWN() {
     EXIT) : ;;
     *) _ERR "Invalid shutdown signal: $1" 0 127
   esac
-  echo "==> SHUTDOWN: $1"
+  _echo "==> SHUTDOWN: $1"
   _CLEANUP
 }
 
@@ -85,7 +88,7 @@ _add_cleanup_paths() {
 _load_info_file() {
   # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
   if [ "${1#${1%.info}}"_ != '.info'_ ]; then
-    >&2 echo "WARNING: Expected argument 1 (sidecar info file) to have an extension of \".info\": ${1}"
+    >&2 _echo "WARNING: Expected argument 1 (sidecar info file) to have an extension of \".info\": ${1}"
   fi
   {
     read -r __v; case "$__v" in
@@ -102,65 +105,48 @@ _load_info_file() {
   } < "$1"; unset __k __v
 }
 
-run() {
+reconstruct_source() {
   __source_list="$1"
   __total_bytes="$2"
-  __target="$3"
+  __toolchain="${3-}"
   __block_size="${4:-BLOCKSIZE}"
   __source_destroy="${5:-0}"
-  # TODO Rename fifo to __fifo or remove altogether depending on benchmark result
-  #fifo="${source}.fifo~${$}"
-  #mkfifo -m 0600 "$fifo"
-  #_add_cleanup_paths "$fifo"
 
   # TODO Does this belong here or below in main? (Prob. the latter)
   if [ "$INPLACE" -eq 1 ]; then
     # TODO ASK FOR CONFIRMATION!
-    >&2 echo "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
+    _errecho "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
     trap - INT
   fi
+  
+  __read_bytes=0
+  __remaining_bytes="$__total_bytes"
+  for __f in $__source_list; do
+    __f_size="$(stat -c%s "$__f")"
+    __f_remaining_bytes="$__f_size"
+    __f_pos=0
+    __dd_bytes="$__block_size"
+    while : ; do
+      [ $__remaining_bytes -gt 0 ] || break
+      [ $__f_remaining_bytes -gt 0 ] || break
 
-  #exec 3<> "$fifo"
-  {
-    __read_bytes=0
-    __remaining_bytes="$__total_bytes"
-    for __f in $__source_list; do
-      __f_size="$(\stat -c%s "$__f")"
-      __f_remaining_bytes="$__f_size"
-      __f_pos=0
-      __dd_bytes="$__block_size"
-      while : ; do
-        [ $__remaining_bytes -gt 0 ] || break
-        [ $__f_remaining_bytes -gt 0 ] || break
+      [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
+      [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
 
-        [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
-        [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
+      #_echo "Read from: $__rpos"
+      dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes #>"$fifo"
 
-        #echo "Read from: $__rpos"
-        \dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes #>"$fifo"
-
-        __f_pos=$(($__f_pos + $__dd_bytes))
-        __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
-        __read_bytes=$(($__read_bytes + $__dd_bytes))
-        __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
-        #echo "fallocate"
-        #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
-        break # TODO REMOVE
-      done
-      >&2 echo "FILE DONE: ${__f}"
+      __f_pos=$(($__f_pos + $__dd_bytes))
+      __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
+      __read_bytes=$(($__read_bytes + $__dd_bytes))
+      __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
+      #_echo "fallocate"
+      #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
+      break # TODO REMOVE
     done
-    >&2 echo "READ DONE"
-  } \
-    | btrfs receive -v /dev/null; echo ">>>${?}" # "$__target"
-  #} & __r_pid=$!
-
-  #outfile=/tmp/btrbk-restore.out # TODO Remove
-  #dd status=none bs=1M count="$total_size" iflag=count_bytes of="$outfile" <"$fifo" & write_pid=$!
-
-  # Need dd here or btrfs receive blocks forever at end like dd does without count (how to fix this fifo EOF issue?)
-  #< "$fifo" dd status=none bs=1M count="$__total_bytes" iflag=count_bytes | btrfs receive -v "$__target" & __w_pid=$!
-
-  #wait $__r_pid $__w_pid
+    _errecho "FILE DONE: ${__f}"
+  done
+  _errecho "READ DONE"
 }
 
 _require_bin() { __p="$(command -v "$1" ||:)" ;
@@ -218,6 +204,7 @@ fi
 file_list=${source_glob:-$source}
 
 # Source sanity checks and preliminary info gathering
+toolchain=
 total_size=0
 for f in $file_list; do
   # Attempt capturing the filesystem name which houses the source file(s) to test for fallocate --punch-hole compat
@@ -233,26 +220,25 @@ if [ -e "${target}/${subvol_name}" ]; then
   _ERR "Restore target exists, aborting: ${target}/${subvol_name}"
 fi
 
-set +e; target_info="$(btrfs sub show "$target")"; set -e
+set +e; target_info="$(btrfs subvolume show "$target")"; set -e
 [ $? -eq 0 ] || target_info=
 
 if [ -z "$target_info" ]; then
-  _ERR "Restore target does not appear to be a btrfs subvolume (\"btrfs show '${target}'\" failed)"
+  _ERR "Restore target does not appear to be a btrfs subvolume (\"btrfs sub show '${target}'\" failed)"
 fi
 
-if echo "$target_info" | grep Flags: | grep -q readonly; then
+if printf '%s' "$target_info" | grep Flags: | grep -q readonly; then
   _ERR "Restore target appears to be readonly: ${target}"
 fi
 
 # Main
-run "$file_list" $total_size "$target" "$BLOCKSIZE" 0
+reconstruct_source "$file_list" $total_size "$toolchain" "$BLOCKSIZE" 0 \
+| btrfs receive -v /dev/null; _echo ">>>${?}" # "$target"
 
-exit
+exit 0
 
-##### MAIN BODY SEQ
-# * ? unsplit DONE
-#   - loop split files for easy truncation (recalc filesize for each)
-# * ? unencrypt
+##### TODO
+ * ? unencrypt
 #   - openssl
 #     - keyfile
 #     - kdf
@@ -260,7 +246,3 @@ exit
 # * ? uncompress
 #   - xz
 #   - gzip
-
-# FIFO usage w/ dd:
-# dd if=/dev/zero bs=1M count=1024 >$fifo &
-# dd of=/dev/null <$fifo
