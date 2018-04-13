@@ -27,12 +27,13 @@ _str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ]; }
 # "_trap $callback $signal..." - passes $signal as argument 1 to $callback, var prefix: "__trap_", ex: _trap 'echo $1' INT TERM EXIT
 _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
 
-# "_safe_dquoteval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ for use in eval'd double quoted strings, ex: eval "echo \"$(_safe_dquoteval "\$(date)")\""
-_safe_dquoteval() {  printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; }
+# "_safe_dquoteval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ and wraps the result in double-quotes for use in eval'd double-quoted strings, ex: eval "echo $(_safe_dquoteval "\$(date)")"
+# WARNING: Do NOT wrap the output of this function in escaped double-quotes at the call site! WRONG: eval "echo \"$(_safe_dquoteval "\$(date)")\""
+_safe_dquoteval() {  printf '"'; printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; printf '"'; }
 
 # "_safe_eval_setvar $name $value" - validates $name and sanitizes $value using _safe_dquoteval before setting the variable using eval
 _safe_eval_setvar() {
-  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "${1}=\"$(_safe_dquoteval "$2")\""; }
+  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; _echo eval "${1}=$(_safe_dquoteval "$2")"; }
 
 # "_require_bin $command [$pkgname]" - enforces the existence of an executable name in $PATH, var prefix: "__reqbin_", ex: _require_bin btrfs btrfs-progs
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
