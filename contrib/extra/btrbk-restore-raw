@@ -10,10 +10,90 @@ set -eu # exit on error, error on unset
 
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 
-_echo() { if [ $# -lt 2 ]; then printf '%s\n' "${1-}"; else __s=; for __a in "$@"; do __s="$__s $__a"; done; printf '%s\n' "$__s"; unset __a __s; fi }
+# "_echo [$string...]", var prefix: "__echo_"
+_echo() { [ $# -lt 2 ] && { printf '%s\n' "${1-}"; return; }
+  __echo_s=; for __echo_i in "$@"; do __echo_s="$__echo_s $__echo_i"; done; printf '%s\n' "$__echo_s"; unset __echo_s __echo_i; }
 _errecho() { >&2 _echo "$@"; }
-_str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ] ; }
-_trap() { __cb="$1"; shift; for __s in "$@" ; do trap "$__cb $__s" "$__s"; done; unset __cb __s ; }
+echo() { _echo "$@"; } # Override system echo
+
+# "_str_contains $haystack $needle", returns 0 if <needle> is contained in <haystack>, ex: "if _str_contains abc b; ..."
+_str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ]; }
+
+# "_trap $callback> $signal...", var prefix: "__trap_", passes <signal> as argument 1 to <callback>, ex: "_trap 'echo $1' INT TERM EXIT"
+_trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
+
+# "_require_bin $command [$pkgname]", var prefix: "__reqbin_", ex: "_require_bin btrfs btrfs-progs"
+_require_bin() { __reqbin_p="$(command -v "$1" ||:)"
+  # Ensure that $__reqbin_p is both absolute (starts with "/") and also ends in "/<command_name>" ("/binfile" matches)
+  [ "${__reqbin_p%${__reqbin_p#?}}${__reqbin_p#${__reqbin_p%/${1}}}" = "//${1}" ] || _DEPENDENCY_ERR "$1" "$2"; unset __reqbin_p; }
+
+# "_load_info_file $file", var prefix: "__ldinfo_"
+_load_info_file() {
+  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
+  if [ "${1#${1%.info}}"_ != '.info'_ ]; then
+    _errcho "WARNING: Expected info (sidecar) file to have an extension of \".info\": ${1}"
+  fi
+  {
+    read -r __ldinfo_v
+    case "$__ldinfo_v" in
+      '#btrbk-'*) ;;
+      *) _ERR "Info (sidecar) file does not start with a #btrbk-v\${VERSION} line: ${1}"
+    esac
+    while IFS="=" read -r __ldinfo_k __ldinfo_v; do
+      case "$__ldinfo_k" in
+        '') ;;
+        '#'*) ;;
+        *)
+          { echo "$__ldinfo_k" | grep -q '[^A-Za-z0-9_]'; } && _ERR "Info (sidecar) file has an invalid key: ${1}"
+          eval "__INFOFILE__${__ldinfo_k}=\"$(echo "${__ldinfo_v}" | sed 's/["\\]/\\&/g')\""
+      esac
+    done
+  } < "$1"; unset __ldinfo_k __ldinfo_v
+}
+
+_reconstruct_source() {
+  __source_list="$1"
+  __total_bytes="$2"
+  __toolchain="${3-}"
+  __block_size="${4:-BLOCKSIZE}"
+  __source_destroy="${5:-0}"
+
+  # TODO Does this belong here or below in main? (Prob. the latter)
+  if [ "$INPLACE" -eq 1 ]; then
+    # TODO ASK FOR CONFIRMATION!
+    _errecho "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
+    trap - INT
+  fi
+
+  __read_bytes=0
+  __remaining_bytes="$__total_bytes"
+  for __f in $__source_list; do
+    __f_size="$(stat -c%s "$__f")"
+    __f_remaining_bytes="$__f_size"
+    __f_pos=0
+    __dd_bytes="$__block_size"
+    while : ; do
+      [ $__remaining_bytes -gt 0 ] || break
+      [ $__f_remaining_bytes -gt 0 ] || break
+
+      [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
+      [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
+
+      #_echo "Read from: $__rpos"
+      dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes
+
+      __f_pos=$(($__f_pos + $__dd_bytes))
+      __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
+      __read_bytes=$(($__read_bytes + $__dd_bytes))
+      __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
+      #_echo "fallocate"
+      #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
+      break # TODO REMOVE
+    done
+    _errecho "FILE DONE: ${__f}"
+  done
+  _errecho "READ DONE"
+}
 
 _USAGE() {
   >&2 printf \
@@ -42,9 +122,6 @@ TRACE=1    Enable shell trace output
   exit 1
 }
 
-# TODO TESTRUN make sure key can decrypt, or passphrase is correct, all utilities work, etc before INPLACE destructive read
-
-
 _ERR() {
   _errecho 'ERROR: ' "$@"
   [ "${2:-0}" -eq 1 ] && { _errecho; USAGE; }
@@ -56,13 +133,14 @@ _DEPENDENCY_ERR() {
   exit 9
 }
 
-_CLEANUP() (
+_CLEANUP() ( # VAR PREFIX: __clnup_
   set +e
-  __l="${__cleanup_paths-}"; while [ "$__l" != "${__l2-}" ]; do
-    __l="${__l2:-${__l}}"; __l2="${__l%${__file_path_sep}*}"
-    __v="${__l#${__l2}${__file_path_sep}}"
-    rm "$__v"
-  done; unset __l __l2 __v
+  __clnup_l="${__clnup_paths-}"; while [ "$__clnup_l" != "${__clnup_l2-}" ]; do
+    __clnup_l="${__clnup_l2:-${__clnup_l}}"
+    __clnup_l2="${__clnup_l%${__file_path_sep}*}"
+    __clnup_v="${__clnup_l#${__clnup_l2}${__file_path_sep}}"
+    rm "$__clnup_v"
+  done; unset __clnup_l __clnup_l2 __clnup_v
 )
 
 _SHUTDOWN() {
@@ -77,167 +155,99 @@ _SHUTDOWN() {
   _CLEANUP
 }
 
+# "_add_cleanup_paths $glob...", var prefix: "__clnpth_"
 _add_cleanup_paths() {
   : "${__file_path_sep:="$(printf '\001')"}"
-  for __p in "$@"; do
-    _str_contains "$__p" "$__file_path_sep" && _ERR 'Path contains list separator char'
-    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__file_path_sep}}${__p}"
-  done; unset __p
+  for __clnpth_p in "$@"; do
+    _str_contains "$__clnpth_p" "$__file_path_sep" && _ERR 'Path contains list separator char'
+    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__file_path_sep}}${__clnpth_p}"
+  done; unset __clnpth_p
 }
 
-_load_info_file() {
-  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
-  if [ "${1#${1%.info}}"_ != '.info'_ ]; then
-    >&2 _echo "WARNING: Expected argument 1 (sidecar info file) to have an extension of \".info\": ${1}"
-  fi
-  {
-    read -r __v; case "$__v" in
-      '#btrbk-'*) ;;
-      *) _ERR "Info (sidecar) file does not start with a #btrbk-v\${VERSION} line"
-    esac
-    while IFS="=" read -r __k __v; do
-      case "$__k" in
-        '') ;;
-        '#'*) ;;
-        *) eval "__INFOFILE__${__k}='${__v}'"
-      esac
-    done
-  } < "$1"; unset __k __v
-}
+_MAIN() {
+  _trap _SHUTDOWN INT TERM EXIT
 
-reconstruct_source() {
-  __source_list="$1"
-  __total_bytes="$2"
-  __toolchain="${3-}"
-  __block_size="${4:-BLOCKSIZE}"
-  __source_destroy="${5:-0}"
-
-  # TODO Does this belong here or below in main? (Prob. the latter)
+  # Required dependencies
+  _require_bin grep     grep
+  _require_bin sed      sed
+  _require_bin btrfs    btrfs-progs
+  _require_bin basename coreutils
+  _require_bin dirname  coreutils
+  _require_bin dd       coreutils
+  _require_bin readlink coreutils
+  _require_bin stat     coreutils
   if [ "$INPLACE" -eq 1 ]; then
-    # TODO ASK FOR CONFIRMATION!
-    _errecho "WARNING: Disabling SIGINT (Ctrl-c) for destructive operation!"
-    trap - INT
+    _require_bin findmnt  util-linux
   fi
-  
-  __read_bytes=0
-  __remaining_bytes="$__total_bytes"
-  for __f in $__source_list; do
-    __f_size="$(stat -c%s "$__f")"
-    __f_remaining_bytes="$__f_size"
-    __f_pos=0
-    __dd_bytes="$__block_size"
-    while : ; do
-      [ $__remaining_bytes -gt 0 ] || break
-      [ $__f_remaining_bytes -gt 0 ] || break
 
-      [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
-      [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
+  # Script arguments
+  source_info="${1-}"
+  target="${2-}"
 
-      #_echo "Read from: $__rpos"
-      dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes #>"$fifo"
+  # Source check
+  if [ -z "$source_info" ]; then
+    _ERR "Info (sidecar) file was not specified" 1
+  elif ! [ -r "$source_info" ]; then
+    _ERR "Info (sidecar) file doesn't exist or isn't readable: ${source_info}"
+  fi
 
-      __f_pos=$(($__f_pos + $__dd_bytes))
-      __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
-      __read_bytes=$(($__read_bytes + $__dd_bytes))
-      __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
-      #_echo "fallocate"
-      #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
-      break # TODO REMOVE
-    done
-    _errecho "FILE DONE: ${__f}"
+  source_dir="$(dirname "$(readlink -f "$source_info")")"
+  source_info="${source_dir}/${source_info##*/}" # Canonicalize
+  _load_info_file "$source_info"
+  source_name="${__INFOFILE__FILE##*/}"
+  subvol_name="${source_name%.btrfs*}"
+  source="${source_dir}/${source_name}"
+
+  if [ "${__INFOFILE__INCOMPLETE-0}" -eq 1 ]; then
+    _ERR "Raw backup file is marked incomplete"
+  fi
+
+  if [ -n "${__INFOFILE__split+x}" ]; then
+    source_glob="${source}.split_*"
+  fi
+
+  file_list=${source_glob:-$source}
+
+  # Source sanity checks and preliminary info gathering
+  toolchain=
+  total_size=0
+  for f in $file_list; do
+    # Attempt capturing the filesystem name which houses the source file(s) to test for fallocate --punch-hole compat
+    [ "$INPLACE" -eq 1 ] && "${source_fs:="$(findmnt -n -o FSTYPE --target "$f")"}"
+    [ -r "$f" ] || _ERR "File doesn't exist or isn't readable: ${f}"
+    fsize="$(stat -c%s "$f")"
+    [ "$fsize" -gt 0 ] || _ERR "Source file appears empty (size is 0 bytes): ${f}"
+    total_size=$(($total_size + $fsize))
   done
-  _errecho "READ DONE"
+
+  # Target sanity checks
+  if [ -e "${target}/${subvol_name}" ]; then
+    _ERR "Restore target exists, aborting: ${target}/${subvol_name}"
+  fi
+
+  set +e; target_info="$(btrfs subvolume show "$target")"; set -e
+  [ $? -eq 0 ] || target_info=
+
+  if [ -z "$target_info" ]; then
+    _ERR "Restore target does not appear to be a btrfs subvolume (\"btrfs sub show '${target}'\" failed)"
+  fi
+
+  if printf '%s' "$target_info" | grep Flags: | grep -q readonly; then
+    _ERR "Restore target appears to be readonly: ${target}"
+  fi
+
+  # Main
+  _reconstruct_source "$file_list" $total_size "$toolchain" "$BLOCKSIZE" 0 \
+  | btrfs receive -v "$target" #; _echo ">>>${?}" # "$target"
+
+  exit 0
 }
 
-_require_bin() { __p="$(command -v "$1" ||:)" ;
-  # Ensure that $__p is absolute and ends in "/<command_name>"
-  [ "${__p%${__p#?}}${__p#${__p%/${1}}}" = "//${1}" ] || _DEPENDENCY_ERR "$1" "$2"
-unset __p; }
-
-
-_trap _SHUTDOWN INT TERM EXIT
-
-# Required dependencies
-_require_bin btrfs    btrfs-progs
-_require_bin basename coreutils
-_require_bin dirname  coreutils
-_require_bin dd       coreutils
-_require_bin mkfifo   coreutils
-_require_bin readlink coreutils
-_require_bin stat     coreutils
-if [ "$INPLACE" -eq 1 ]; then
-  _require_bin findmnt  util-linux
-fi
-
-# Script arguments
-source_info="${1-}"
-target="${2-}"
-
-# Source check
-if [ -z "$source_info" ]; then
-  _ERR "Info (sidecar) file was not specified" 1
-elif ! [ -r "$source_info" ]; then
-  _ERR "Info (sidecar) file doesn't exist or isn't readable: ${source_info}"
-fi
-
-source_dir="$(dirname "$(readlink -f "$source_info")")"
-
-source_info="${source_dir}/${source_info##*/}" # Canonicalize
-
-_load_info_file "$source_info"
-
-source_name="${__INFOFILE__FILE##*/}"
-
-subvol_name="${source_name%.btrfs*}"
-
-source="${source_dir}/${source_name}"
-
-if [ "${__INFOFILE__INCOMPLETE-0}" -eq 1 ]; then
-  _ERR "Raw backup file is marked incomplete"
-fi
-
-if [ -n "${__INFOFILE__split+x}" ]; then
-  source_glob="${source}.split_*"
-# .split_
-fi
-
-file_list=${source_glob:-$source}
-
-# Source sanity checks and preliminary info gathering
-toolchain=
-total_size=0
-for f in $file_list; do
-  # Attempt capturing the filesystem name which houses the source file(s) to test for fallocate --punch-hole compat
-  [ "$INPLACE" -eq 1 ] && "${source_fs:="$(findmnt -n -o FSTYPE --target "$f")"}"
-  [ -r "$f" ] || _ERR "File doesn't exist or isn't readable: ${f}"
-  fsize="$(stat -c%s "$f")"
-  [ "$fsize" -gt 0 ] || _ERR "Source file appears empty (size is 0 bytes): ${f}"
-  total_size=$(($total_size + $fsize))
-done
-
-# Target sanity checks
-if [ -e "${target}/${subvol_name}" ]; then
-  _ERR "Restore target exists, aborting: ${target}/${subvol_name}"
-fi
-
-set +e; target_info="$(btrfs subvolume show "$target")"; set -e
-[ $? -eq 0 ] || target_info=
-
-if [ -z "$target_info" ]; then
-  _ERR "Restore target does not appear to be a btrfs subvolume (\"btrfs sub show '${target}'\" failed)"
-fi
-
-if printf '%s' "$target_info" | grep Flags: | grep -q readonly; then
-  _ERR "Restore target appears to be readonly: ${target}"
-fi
-
-# Main
-reconstruct_source "$file_list" $total_size "$toolchain" "$BLOCKSIZE" 0 \
-| btrfs receive -v /dev/null; _echo ">>>${?}" # "$target"
-
-exit 0
+_MAIN "$@"
 
 ##### TODO
+# * Build $toolchain pipeline string and eval it safely in _reconstruct_source
+# * TESTRUN: make sure key can decrypt, or passphrase is correct, all utilities work, etc before INPLACE destructive read
 # * ? unencrypt
 #   - openssl
 #     - keyfile
