@@ -9,35 +9,49 @@ set -eu # exit on error, error on unset
 : "${INPLACE:=0}" # INPLACE=1 btrbk-restore-raw ...
 
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
+BLOCKSIZE=$(($BLOCKSIZE + 0))
 
-# "_echo [$string...]", var prefix: "__echo_"
-_echo() { [ $# -lt 2 ] && { printf '%s\n' "${1-}"; return; }
+# "_echo [$string...]" - println to STDOUT, var prefix: "__echo_"
+_echo() { [ $# -le 1 ] && { printf '%s\n' "${1-}"; return; }
   __echo_s=; for __echo_i in "$@"; do __echo_s="$__echo_s $__echo_i"; done; printf '%s\n' "$__echo_s"; unset __echo_s __echo_i; }
-_errecho() { >&2 _echo "$@"; }
-echo() { _echo "$@"; } # Override system echo
 
-# "_str_contains $haystack $needle", returns 0 if <needle> is contained in <haystack>, ex: "if _str_contains abc b; ..."
+# "see: _echo" - println to STDERR
+_errecho() { >&2 _echo "$@"; }
+
+# "" - do not use, overrides system echo to enforce _echo usage
+echo() { _ERR "Use _echo instead of echo"; }
+
+# "_str_contains $haystack $needle" - returns 0 if $needle is contained in $haystack, ex: if _str_contains abc b; ...
 _str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ]; }
 
-# "_trap $callback> $signal...", var prefix: "__trap_", passes <signal> as argument 1 to <callback>, ex: "_trap 'echo $1' INT TERM EXIT"
+# "_trap $callback $signal..." - passes $signal as argument 1 to $callback, var prefix: "__trap_", ex: _trap 'echo $1' INT TERM EXIT
 _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
 
-# "_safe_dquoteval $value", prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with backslash (\) for use in eval'd double quoted strings, ex: eval "echo \"$(_safe_dquoteval "\$(date)")\""
+# "_safe_dquoteval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ for use in eval'd double quoted strings, ex: eval "echo \"$(_safe_dquoteval "\$(date)")\""
 _safe_dquoteval() {  printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; }
-# "_safe_eval_setvar $name $value", validates $name and sanitizes $value using _safe_dquoteval
+
+# "_safe_eval_setvar $name $value" - validates $name and sanitizes $value using _safe_dquoteval before setting the variable using eval
 _safe_eval_setvar() {
   { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "${1}=\"$(_safe_dquoteval "$2")\""; }
 
-# "_require_bin $command [$pkgname]", var prefix: "__reqbin_", ex: "_require_bin btrfs btrfs-progs"
+# "_require_bin $command [$pkgname]" - enforces the existence of an executable name in $PATH, var prefix: "__reqbin_", ex: _require_bin btrfs btrfs-progs
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
   # Ensure that $__reqbin_p is both absolute (starts with "/") and also ends in "/<command_name>" ("/binfile" matches)
   [ "${__reqbin_p%${__reqbin_p#?}}${__reqbin_p#${__reqbin_p%/${1}}}" = "//${1}" ] || _DEPENDENCY_ERR "$1" "$2"; unset __reqbin_p; }
 
-# "_load_info_file $file", var prefix: "__ldinfo_"
+# "_add_cleanup_paths $glob..." - adds paths (globs) to unlink during _CLEANUP, var prefix: "__clnpth_"
+_add_cleanup_paths() {
+  : "${__file_path_sep:="$(printf '\001')"}"
+  for __clnpth_p in "$@"; do
+    _str_contains "$__clnpth_p" "$__file_path_sep" && _ERR 'Path contains list separator char'
+    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__file_path_sep}}${__clnpth_p}"
+  done; unset __clnpth_p
+}
+
+# "_load_info_file $file" - loads K/V pairs from $file into variables named __INFOFILE__${KEY}, var prefix: "__ldinfo_"
 _load_info_file() {
-  # Reads a raw backup sidecar file into the current environment with a var (key) prefix of __INFOFILE__
   if [ "${1#${1%.info}}"_ != '.info'_ ]; then
-    _errcho "WARNING: Expected info (sidecar) file to have an extension of \".info\": ${1}"
+    _errecho "WARNING: Expected info (sidecar) file to have an extension of \".info\": ${1}"
   fi
   {
     read -r __ldinfo_v
@@ -57,9 +71,9 @@ _load_info_file() {
 
 _reconstruct_source() {
   __source_list="$1"
-  __total_bytes="$2"
+  __total_bytes=$(($2 + 0))
   __toolchain="${3-}"
-  __block_size="${4:-BLOCKSIZE}"
+  __block_size=$((${4:-BLOCKSIZE} + 0))
   __source_destroy="${5:-0}"
 
   # TODO Does this belong here or below in main? (Prob. the latter)
@@ -127,7 +141,7 @@ TRACE=1    Enable shell trace output
 }
 
 _ERR() {
-  _errecho 'ERROR: ' "$@"
+  _errecho "ERROR: ${1}"
   [ "${2:-0}" -eq 1 ] && { _errecho; USAGE; }
   exit "${3:-1}"
 }
@@ -157,15 +171,6 @@ _SHUTDOWN() {
   esac
   _echo "==> SHUTDOWN: $1"
   _CLEANUP
-}
-
-# "_add_cleanup_paths $glob...", var prefix: "__clnpth_"
-_add_cleanup_paths() {
-  : "${__file_path_sep:="$(printf '\001')"}"
-  for __clnpth_p in "$@"; do
-    _str_contains "$__clnpth_p" "$__file_path_sep" && _ERR 'Path contains list separator char'
-    __cleanup_paths="${__cleanup_paths-}${__cleanup_paths:+${__file_path_sep}}${__clnpth_p}"
-  done; unset __clnpth_p
 }
 
 _MAIN() {
