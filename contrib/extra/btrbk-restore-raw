@@ -22,6 +22,12 @@ _str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ]; }
 # "_trap $callback> $signal...", var prefix: "__trap_", passes <signal> as argument 1 to <callback>, ex: "_trap 'echo $1' INT TERM EXIT"
 _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
 
+# "_safe_dquoteval $value", prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with backslash (\) for use in eval'd double quoted strings, ex: eval "echo \"$(_safe_dquoteval "\$(date)")\""
+_safe_dquoteval() {  printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; }
+# "_safe_eval_setvar $name $value", validates $name and sanitizes $value using _safe_dquoteval
+_safe_eval_setvar() {
+  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "${1}=\"$(_safe_dquoteval "$2")\""; }
+
 # "_require_bin $command [$pkgname]", var prefix: "__reqbin_", ex: "_require_bin btrfs btrfs-progs"
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
   # Ensure that $__reqbin_p is both absolute (starts with "/") and also ends in "/<command_name>" ("/binfile" matches)
@@ -43,9 +49,7 @@ _load_info_file() {
       case "$__ldinfo_k" in
         '') ;;
         '#'*) ;;
-        *)
-          { echo "$__ldinfo_k" | grep -q '[^A-Za-z0-9_]'; } && _ERR "Info (sidecar) file has an invalid key: ${1}"
-          eval "__INFOFILE__${__ldinfo_k}=\"$(echo "${__ldinfo_v}" | sed 's/["\\]/\\&/g')\""
+        *) _safe_eval_setvar "__INFOFILE__${__ldinfo_k}" "$__ldinfo_v" || _ERR "Info (sidecar) file has an invalid key: ${1}"
       esac
     done
   } < "$1"; unset __ldinfo_k __ldinfo_v
