@@ -11,6 +11,33 @@ set -eu # exit on error, error on unset
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 BLOCKSIZE=$(($BLOCKSIZE + 0))
 
+# POSIX specifies only signed long C ints for arithmetic expansion $(())
+if 2>/dev/null [ "$((9223372036854775807 + 0))" = '9223372036854775807' ]; then
+  INTMAX=9223372036854775807 # SInt64
+elif 2/dev/null [ "$((2147483647 + 0))" = '2147483647' ]; then
+  INTMAX=2147483647 # SInt32
+  _errecho "WARNING: This system only supports file sizes <2GB"
+else
+  _ERR "This system doesn't support signed integers >= 32 bits"
+fi
+
+_test_parse_num() { 2>/dev/null [ $(($1 + 0)) = "$1" ]; }
+
+# Add two positive numbers without overflows
+_safe_add() {
+  [ -n "${1#-*}" ] || _ERR "_safe_add: Operand 1 must be positive"
+  [ -n "${2#-*}" ] || _ERR "_safe_add: Operand 2 must be positive"
+  # TODO allow for negative (or mixed) operands
+  # * If both negative ensure result is not > 0
+  # * If mixed ensure result is not > than the positive one
+  # Validate operands using test (triggers error on overflow)
+  _test_parse_num "$1" || _ERR "_safe_add: Failed parsing operand 1 (overflow?): ${1}"
+  _test_parse_num "$2" || _ERR "_safe_add: Failed parsing operand 2 (overflow?): ${2}"
+  # Validate result
+  [ $(($1 + $2 < 0)) -eq 1 ] && _ERR "_safe_add: Overflow in (${1} + ${2})"
+  printf '%d' $(($1 + $2))
+}
+
 # "_echo [$string...]" - println to STDOUT, var prefix: "__echo_"
 _echo() { [ $# -le 1 ] && { printf '%s\n' "${1-}"; return; }
   __echo_s=; for __echo_i in "$@"; do __echo_s="$__echo_s $__echo_i"; done; printf '%s\n' "$__echo_s"; unset __echo_s __echo_i; }
@@ -33,7 +60,7 @@ _safe_dquoteval() {  printf '"'; printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; print
 
 # "_safe_eval_setvar $name $value" - validates $name and sanitizes $value using _safe_dquoteval before setting the variable using eval
 _safe_eval_setvar() {
-  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; _echo eval "${1}=$(_safe_dquoteval "$2")"; }
+  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "${1}=$(_safe_dquoteval "$2")"; }
 
 # "_require_bin $command [$pkgname]" - enforces the existence of an executable name in $PATH, var prefix: "__reqbin_", ex: _require_bin btrfs btrfs-progs
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
@@ -70,6 +97,83 @@ _load_info_file() {
   } < "$1"; unset __ldinfo_k __ldinfo_v
 }
 
+_dd_saferead() {
+  __ddsafe_totalbytes=$(($1 + 0)); shift # -1 for infinite
+  [ $__ddsafe_totalbytes -lt $INTMAX ] || _ERR 'Ambiguous size for total bytes'
+  __ddsafe_blockbytes=$(($1 + 0)); shift
+  __ddsafe_retries=$(($1 + 0)); shift # -1 for infinite
+  # If totalbytes is -1 read until EOF (dd reads 0 bytes)
+  # direct STDOUT of dd to shell STDOUT
+  # direct STDERR of dd to grep/whatever then into variable $__dd_safe_readbytes
+
+  __ddsafe_readbytes=0
+  __ddsafe_remaining=0
+  __ddsafe_retrycount=0
+  while : ; do
+    if [ $__ddsafe_retries -gt 0 ]; then
+      [ $__ddsafe_retrycount -lt $__ddsafe_retries ] || { _errecho "WARNING: Partial read"; break; }
+    fi
+
+    if [ $__ddsafe_totalbytes -gt 0 ]; then
+      __ddsafe_remaining=$(($__ddsafe_totalbytes - $__ddsafe_readbytes))
+      [ $(($__ddsafe_remaining / $__ddsafe_blockbytes)) -lt 1 ] && __ddsafe_blockbytes=$(($__ddsafe_remaining % $__ddsafe_blockbytes))
+    fi
+
+    { __ddsafe_ddbytes="$(dd bs=${__ddsafe_blockbytes} count=1 "$@" 2>&1 1>&3 | grep '^[0-9][0-9]* bytes.*copied')"; } 3>&1
+
+    [ -n "$__ddsafe_ddbytes" ] || _ERR 'Failed to parse dd status output'
+    __ddsafe_ddbytes=$((${__ddsafe_ddbytes%% bytes*} + 0))
+
+    #_errecho "READ: $__ddsafe_ddbytes bytes"
+
+    [ $__ddsafe_ddbytes -gt 0 ] || { _errecho "WARNING: 0 byte read"; __ddsafe_retrycount=$(($__ddsafe_retrycount + 1)); continue; }
+
+    # Read >0 bytes
+    __ddsafe_retrycount=0
+    __ddsafe_readbytes="$(_safe_add $__ddsafe_readbytes $__ddsafe_ddbytes)"
+
+    [ $__ddsafe_readbytes -eq $__ddsafe_totalbytes ] && break
+  done
+}
+
+_test_source() {
+  # Verifies the beginning and end of the stream
+  __tstsrc_total_bytes=$(($2 + 0))
+  __SENDSTREAM__subvolname=
+  _reconstruct_source "$1" "$2" "$3" $((1024 * 1024)) 0 | {
+    # NOTE: The send stream stores number values as little-endian (0x3c, 0x00 is decimal value 60, not 15360)
+    # Thus we can manipulate them as number strings using od and and other tools, as they will terminate reading
+    # on the first 0x00 (null) byte
+    # See: https://btrfs.wiki.kernel.org/index.php/Design_notes_on_Send/Receive
+
+    # send stream header: 17 bytes
+    dd status=none bs=1 count=13 | grep -q ^btrfs-stream         || _ERR "bad magic value" # magic "btrfs-stream\0"
+    dd status=none bs=1 count=4  | grep -q ^"$(printf '\001')"\$ || _ERR "stream version != 0x01" # stream version
+
+    # send command header: 10 bytes
+    dd status=none bs=1 skip=4 count=0 # command size; unneeded as the only info we want is in TLV1
+    # Expect and validate a "Send subvolume or snapshot" command (0x01 or 0x02)
+    __tstsrc_cmdtype=$(($(dd status=none bs=1 count=2 | od -An -vtu2) + 0)) # command type
+    [ $__tstsrc_cmdtype -eq 1 ] || [ $__tstsrc_cmdtype -eq 2 ] || _ERR "command type != 0x01|0x02 "
+    # NOTE: We don't perform a CRC32 check here as we have no easy way of getting the bytes to checksum (they contain 0x0 anyway!)
+    dd status=none bs=1 skip=4 count=0 # CRC32
+
+    # send TLV1 (name) header: 4 bytes
+    dd status=none bs=1 count=2 | grep -q ^"$(printf '\017')"\$ || _ERR "TLV1 type != 0x0f"
+    __tstsrc_subvolname_size=$(($(dd status=none bs=1 count=2 | od -An -vtu2) + 0))
+
+    # send TLV1 (name) payload: $subvolname_size bytes
+    __SENDSTREAM__subvolname="$(dd status=none bs=1 count=$__tstsrc_subvolname_size)"
+
+    # skip to end - 6 bytes (send end command)
+    # TODO? Skip this check altogether and WARN if $__total_bytes is over $4 and fullblock or skip_bytes is unavailable
+    dd status=none bs=1M iflag=fullblock,skip_bytes skip=$(($__tstsrc_total_bytes - 6 - $__tstsrc_subvolname_size - 31)) count=0
+    dd status=none bs=1 count=2 | grep -q ^"$(printf '\025')"\$ || _ERR "send end fail"
+    dd status=none bs=1 count=4 | grep -q ^"$(printf '\120\154\311\235')"\$ || _ERR "send end fail"
+  }
+  unset __tstsrc_total_bytes __tstsrc_subvolname_size __tstsrc_cmdtype
+}
+
 _reconstruct_source() {
   __source_list="$1"
   __total_bytes=$(($2 + 0))
@@ -98,20 +202,24 @@ _reconstruct_source() {
       [ $__dd_bytes -le $__remaining_bytes ] || __dd_bytes=$__remaining_bytes
       [ $__dd_bytes -le $__f_remaining_bytes ] || __dd_bytes=$__f_remaining_bytes
 
-      #_echo "Read from: $__rpos"
+
+      # TODO? Use dd without unportable options and WARN if fullblock, skip_bytes, or count_bytes is unavailable
+      # This would require parsing dd's status output to determine the number of bytes read
+      # _errecho "Read from: $__rpos"
       dd status=none if="$__f" bs=1M skip="$__f_pos" count="$__dd_bytes" iflag=fullblock,skip_bytes,count_bytes
 
       __f_pos=$(($__f_pos + $__dd_bytes))
       __f_remaining_bytes=$(($__f_remaining_bytes - $__dd_bytes))
       __read_bytes=$(($__read_bytes + $__dd_bytes))
       __remaining_bytes=$(($__remaining_bytes - $__dd_bytes))
-      #_echo "fallocate"
+
+      # TODO fallocate
+      # _errecho "fallocate"
       #fallocate --keep-size --punch-hole --offset $readpos --length $readsize $infile >&2 &
-      break # TODO REMOVE
     done
-    _errecho "FILE DONE: ${__f}"
+    #_errecho "FILE DONE: ${__f}"
   done
-  _errecho "READ DONE"
+  #_errecho "READ DONE"
 }
 
 _USAGE() {
@@ -194,6 +302,13 @@ _MAIN() {
   source_info="${1-}"
   target="${2-}"
 
+  dd_iflag_fullblock=
+  dd_iflag_skip_bytes=
+  dd_help_text="$(dd --help 2>&1)" || _ERR "Failed to parse help text for dd"
+  [ -z "${dd_help_text##* fullblock *}" ] && dd_iflag_fullblock='iflag=fullblock '
+  [ -z "${dd_help_text##* skip_bytes *}" ] && dd_iflag_skip_bytes='iflag=skip_bytes '
+  # Ex. usage: iflags=${dd_iflag_fullblock}${dd_iflag_skip_bytes}; dd bs=1M $iflags
+
   # Source check
   if [ -z "$source_info" ]; then
     _ERR "Info (sidecar) file was not specified" 1
@@ -226,9 +341,15 @@ _MAIN() {
     [ "$INPLACE" -eq 1 ] && "${source_fs:="$(findmnt -n -o FSTYPE --target "$f")"}"
     [ -r "$f" ] || _ERR "File doesn't exist or isn't readable: ${f}"
     fsize="$(stat -c%s "$f")"
-    [ "$fsize" -gt 0 ] || _ERR "Source file appears empty (size is 0 bytes): ${f}"
+    [ "$fsize" -gt 0 ] || _ERR "Source file appears empty (stat reported 0 bytes or errored): ${f}"
     total_size=$(($total_size + $fsize))
   done
+
+  # $do_test_source && ...
+  _test_source "$file_list" $total_size "$toolchain" || _ERR "Source test failed"
+
+  _echo "NAME FROM STREAM: $__SENDSTREAM__subvolname" # Wait, what?
+  [ -n "${__SENDSTREAM__subvolname-}" ] && subvolname="$__SENDSTREAM__subvolname"
 
   # Target sanity checks
   if [ -e "${target}/${subvol_name}" ]; then
@@ -252,6 +373,10 @@ _MAIN() {
 
   exit 0
 }
+
+total=$((1024 * 1024 * 1024 * 4 + 124283))
+ _dd_saferead $total $((1024 * 1024)) 5 if=/dev/zero | dd bs=1M of=/dev/null
+exit
 
 _MAIN "$@"
 
