@@ -1,6 +1,8 @@
 #!/usr/bin/dash
 # TODO: ^^^^^^^ Revert to /bin/sh
 
+export POSIXLY_CORRECT=1
+
 set -eu # exit on error, error on unset
 [ "${TRACE:=0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
@@ -102,7 +104,7 @@ _load_info_file() {
 }
 
 DD_BLOCKFACTOR=32
-# "_dd_safe $infile[=/dev/stdin|file|...] $blocksize[=$((32 * 1024 * 1024))] [$ddarg...]"
+# "_dd_safe $ddarg..."
 _dd_safe() {
   # dd always outputs full obs blocks (it will block until it can do so), thus we should leverage that
   # to determine the amount of bytes read by dd's status output of records (we NEVER want a partial!)
@@ -111,37 +113,105 @@ _dd_safe() {
   # * if dd doesn't support fullblock we need to synchronize the input of the main dd (dd obs=$size | dd bs=$size ...)
   #  See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
 
-  __ddsafe_if="${1:-/dev/stdin}"; shift
-  __ddsafe_bs="${1:-$((32 * 1024 * 1024))}"; shift
-  _test_parse_num "$__ddsafe_bs"
+  __ddsafe_emu_fullblock=0
+  __ddsafe_emu_skipbytes=0
+  __ddsafe_emu_countbytes=0
+  # Defaults
+  __ddsafe_if=/dev/stdin
+  __ddsafe_of=/dev/stdout
+  # Parse args
+  for __ddsafe_a in "$@"; do
+    _errecho ">>$__ddsafe_a"
+    case "$__ddsafe_a" in
+      if=*)       __ddsafe_if="${__ddsafe_a#if=}" ;;
+      of=*)       __ddsafe_of="${__ddsafe_a#of=}" ;;
+      ibs=*)     __ddsafe_ibs="${__ddsafe_a#ibs=}" ;;
+      obs=*)     __ddsafe_obs="${__ddsafe_a#obs=}" ;;
+      bs=*)       __ddsafe_bs="${__ddsafe_a#bs=}" ;;
+      count=*) __ddsafe_count="${__ddsafe_a#count=}" ;;
+      skip=*)   __ddsafe_skip="${__ddsafe_a#skip=}" ;;
+      seek=*)   __ddsafe_seek="${__ddsafe_a#seek=}" ;;
+      conv=*)   __ddsafe_conv="${__ddsafe_conv:+"${__ddsafe_conv},"}${__ddsafe_a#conv}" ;;
+      iflag=*) __ddsafe_iflag="${__ddsafe_iflag:+"${__ddsafe_iflag},"}${__ddsafe_a#iflag=}" ;;
+      oflag=*) __ddsafe_oflag="${__ddsafe_oflag:+"${__ddsafe_oflag},"}${__ddsafe_a#oflag=}" ;;
+      *) _ERR "Unsupported dd arg: $__ddsafe_a"
+    esac
+  done
 
-  if [ -n "$DD_IFLAG_FULLBLOCK" ]; then
-    { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if"${DD_IFLAG_FULLBLOCK} bs=$__ddsafe_bs 2>&1 1>&3 \
-                         | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
-    } 3>&1
-  else
-    _errecho "WARNING: Simulating dd iflag=fullblock"
-    [ $(($__ddsafe_bs % $DD_BLOCKFACTOR)) -eq 0 ] || _ERR "_dd_safe: argument 2 (block size) must be a multiple of $DD_BLOCKFACTOR"
-    { __ddsafe_stats="$(dd status=none if="$__ddsafe_if" ibs="$(($__ddsafe_bs / $DD_BLOCKFACTOR))" obs=$__ddsafe_bs \
-                         | dd "$@" if=/dev/stdin bs=$__ddsafe_bs 2>&1 1>&3 \
-                         | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
-    } 3>&1
+  # Validate size options (NOTE: all must be byte|count values, no suffixes!)
+  [ ${__ddsafe_ibs+isset} = isset ]   && _test_parse_num "$__ddsafe_ibs"
+  [ ${__ddsafe_obs+isset} = isset ]   && _test_parse_num "$__ddsafe_obs"
+  [ ${__ddsafe_bs+isset} = isset ]    && _test_parse_num "$__ddsafe_bs"
+  [ ${__ddsafe_count+isset} = isset ] && _test_parse_num "$__ddsafe_count"
+  [ ${__ddsafe_skip+isset} = isset ]  && _test_parse_num "$__ddsafe_skip"
+  [ ${__ddsafe_seek+isset} = isset ]  && _test_parse_num "$__ddsafe_seek"
+  # Normalize list options (item[,...]) to remove duplicates and null items (,,[,...])
+  if [ ${__ddsafe_conv+isset} = isset ]; then
+     __ddsafe_conv="conv=$(echo "$__ddsafe_conv" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
+     __ddsafe_args="${__ddsafe_ddargs} conv=${__ddsafe_conv}"
+  fi
+  if [ ${__ddsafe_iflag+isset} = isset ];
+    __ddsafe_iflag="iflag=$(echo "$__ddsafe_iflag" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
+    if _str_contains "$__ddsafe_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -eq 1 ]; then
+      __ddsafe_emu_fullblock=1
+      __ddsafe_a="${__ddsafe_iflag#iflag=}"
+      __ddsafe_a="${__ddsafe_a#*fullblock},${__ddsafe_a%fullblock*}"
+      __ddsafe_a="${__ddsafe_a##,}"
+      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+    fi
+    if _str_contains "$__ddsafe_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -eq 1 ]; then
+      __ddsafe_emu_skipbytes=1
+      __ddsafe_a="${__ddsafe_iflag#iflag=}"
+      __ddsafe_a="${__ddsafe_a#*skip_bytes},${__ddsafe_a%skip_bytes*}"
+      __ddsafe_a="${__ddsafe_a##,}"
+      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+    fi
+    if _str_contains "$__ddsafe_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -eq 1 ]; then
+      __ddsafe_emu_countbytes=1
+      __ddsafe_a="${__ddsafe_iflag#iflag=}"
+      __ddsafe_a="${__ddsafe_a#*count_bytes},${__ddsafe_a%count_bytes*}"
+      __ddsafe_a="${__ddsafe_a##,}"
+      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+    fi
+  fi
+  if [ ${__ddsafe_oflag+isset} = isset ]; then
+     __ddsafe_oflag="oflag=$(echo "$__ddsafe_oflag" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
   fi
 
-  # TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
-  # resilient parsing as well as allowing for error checking
-  [ -n "$__ddsafe_stats" ] || _ERR 'Failed to parse dd status output'
-  __ddsafe_stats_in="${__ddsafe_stats%% records in"$NL"*}"
-  __ddsafe_stats_out="${__ddsafe_stats##"${__ddsafe_stats%%"$NL"*}$NL"}"
-  __ddsafe_stats_out="${__ddsafe_stats_out% records out}"
-  [ ${#__ddsafe_stats_in} -eq 3 ]  && [ -z "${__ddsafe_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
-  [ ${#__ddsafe_stats_out} -eq 3 ] && [ -z "${__ddsafe_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
-  __ddsafe_stats_out_whole="${__ddsafe_stats_out%+*}"
-  __ddsafe_stats_out_partial="${__ddsafe_stats_out#*+}"
-  __ddsafe_stats_in_whole="${__ddsafe_stats_out%+*}"
-  __ddsafe_stats_in_partial="${__ddsafe_stats_in#*+}"
-  _errecho "IN:  $(($__ddsafe_stats_in_whole * $__ddsafe_bs)) + (${__ddsafe_stats_in_partial} * ?)"
-  _errecho "OUT: $(($__ddsafe_stats_out_whole * $__ddsafe_bs)) + (${__ddsafe_stats_out_partial} * ?)"
+  # TODO Emulate skip_bytes and count_bytes
+  # if not has skip_bytes or count_bytes then run in a loop
+
+  #__ddsafe_optargs="${__ddsafe_conv:+"conv=${__ddsafe_conv}"}${__ddsafe_iflag:+"iflag=${__ddsafe_iflag}"}${__ddsafe_oflag:+"${__ddsafe_oflag"}"
+
+  # while : ; do
+    if [ $__ddsafe_emu_fullblock -eq 1 ]; then
+      # [ ${__ddsafe_conv:+isset} = isset ] && __ddsafe_args="${__ddsafe_ddargs} conv=${__ddsafe_conv}"
+      _errecho "WARNING: Emulating dd iflag=fullblock"
+      { __ddsafe_stats="$(dd status=none if="$__ddsafe_if" ibs="${__ddsafe_ibs:-${__ddsafe_bs#bs=}}" obs="$__ddsafe_bs" \
+                          | dd "$@" if=/dev/stdin of="$__ddsafe_of" bs="$__ddsafe_bs" 2>&1 1>&3 \
+                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+      } 3>&1
+    else
+      { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if" iflag= bs=$__ddsafe_bs 2>&1 1>&3 \
+                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+      } 3>&1
+    fi
+
+    # TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
+    # resilient parsing as well as allowing for error checking
+    [ -n "$__ddsafe_stats" ] || _ERR 'Failed to parse dd status output'
+    __ddsafe_stats_in="${__ddsafe_stats%% records in"$NL"*}"
+    __ddsafe_stats_out="${__ddsafe_stats##"${__ddsafe_stats%%"$NL"*}$NL"}"
+    __ddsafe_stats_out="${__ddsafe_stats_out% records out}"
+    [ ${#__ddsafe_stats_in} -eq 3 ]  && [ -z "${__ddsafe_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
+    [ ${#__ddsafe_stats_out} -eq 3 ] && [ -z "${__ddsafe_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
+    __ddsafe_stats_out_whole="${__ddsafe_stats_out%+*}"
+    __ddsafe_stats_out_partial="${__ddsafe_stats_out#*+}"
+    __ddsafe_stats_in_whole="${__ddsafe_stats_out%+*}"
+    __ddsafe_stats_in_partial="${__ddsafe_stats_in#*+}"
+    _errecho "IN:  $(($__ddsafe_stats_in_whole * $__ddsafe_bs)) + (${__ddsafe_stats_in_partial} * ?)"
+    _errecho "OUT: $(($__ddsafe_stats_out_whole * $__ddsafe_bs)) + (${__ddsafe_stats_out_partial} * ?)"
+  # done
 }
 
 _test_source() {
@@ -294,8 +364,9 @@ _MAIN() {
   _trap _SHUTDOWN INT TERM EXIT
 
   # Required dependencies
+  _require_bin awk      awk
   _require_bin grep     grep
-  _require_bin sed      sed
+  _require_bin sed      sed # TODO Replace all sed with awk
   _require_bin btrfs    btrfs-progs
   _require_bin basename coreutils
   _require_bin dirname  coreutils
@@ -305,16 +376,15 @@ _MAIN() {
   _require_bin stat     coreutils
 
   # Feature-test dd
-  DD_IFLAG_FULLBLOCK=
-  dd_iflag_skip_bytes=
-  dd_iflag_count_bytes=
+  DD_IFLAG_FULLBLOCK=0
+  DD_IFLAG_SKIPBYTES=0
+  DD_IFLAG_COUNTBYTES=0
   dd_helptxt="$(dd --help 2>&1)" \
   || dd_helptxt="$(dd -h 2>&1)" \
   || _ERR "Failed to parse help text for dd"
-  [ -z "${dd_helptxt##*fullblock *}" ]   && DD_IFLAG_FULLBLOCK=' iflag=fullblock'
-  [ -z "${dd_helptxt##*skip_bytes *}" ]  && dd_iflag_skip_bytes=' iflag=skip_bytes'
-  [ -z "${dd_helptxt##*count_bytes *}" ] && dd_iflag_count_bytes=' iflag=count_bytes'
-  # Ex. usage: iflags=${DD_IFLAG_FULLBLOCK}${dd_iflag_skip_bytes}; dd bs=1M $iflags
+  _str_contains "$dd_helptxt" fullblock   && DD_IFLAG_FULLBLOCK=1
+  _str_contains "$dd_helptxt" skip_bytes  && DD_IFLAG_SKIPBYTES=1
+  _str_contains "$dd_helptxt" count_bytes && DD_IFLAG_COUNTBYTES=1
 
   if [ "$INPLACE" -eq 1 ]; then
     _require_bin fallocate  util-linux
@@ -325,7 +395,7 @@ _MAIN() {
     falloc_helptxt="$(fallocate --help 2>&1)" \
     || falloc_helptxt="$(fallocate -h 2>&1)" \
     || _ERR "Failed to parse help text for fallocate"
-    [ -z "${falloc_helptxt##*--punch-hole*}" ] && falloc_punch_hole=' --punch-hole'
+    _str_contains "$falloc_helptxt" --punch-hole && falloc_punch_hole=' --punch-hole'
 
     # TODO Feature-test findmnt
   fi
@@ -334,8 +404,8 @@ total=$((1024 * 1024 * 1024 + 124283))
 #dd status=none ibs=3 obs=7 if=/dev/random
 set +x
 DD_BLOCKFACTOR=1
-DD_IFLAG_FULLBLOCK=
-_dd_safe resume-test.20180410T234657-0400.btrfs.split_ad 131283949 count=2 | pv -bn >/dev/null
+DD_IFLAG_FULLBLOCK=0
+_dd_safe if=resume-test.20180410T234657-0400.btrfs.split_ad bs=131283949 count=2 | pv -bn >/dev/null
 exit
 
   # Script arguments
