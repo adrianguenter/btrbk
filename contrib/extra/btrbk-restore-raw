@@ -116,12 +116,13 @@ _dd_safe() {
   _test_parse_num "$__ddsafe_bs"
 
   if [ -n "$DD_IFLAG_FULLBLOCK" ]; then
-    { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if" "${DD_IFLAG_FULLBLOCK}" bs=$__ddsafe_bs 2>&1 1>&3 \
+    { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if"${DD_IFLAG_FULLBLOCK} bs=$__ddsafe_bs 2>&1 1>&3 \
                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
     } 3>&1
   else
+    _errecho "WARNING: Simulating dd iflag=fullblock"
     [ $(($__ddsafe_bs % $DD_BLOCKFACTOR)) -eq 0 ] || _ERR "_dd_safe: argument 2 (block size) must be a multiple of $DD_BLOCKFACTOR"
-    { __ddsafe_stats="$(dd if="$__ddsafe_if" ibs="$(($__ddsafe_bs / $DD_BLOCKFACTOR))" obs=$__ddsafe_bs \
+    { __ddsafe_stats="$(dd status=none if="$__ddsafe_if" ibs="$(($__ddsafe_bs / $DD_BLOCKFACTOR))" obs=$__ddsafe_bs \
                          | dd "$@" if=/dev/stdin bs=$__ddsafe_bs 2>&1 1>&3 \
                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
     } 3>&1
@@ -141,7 +142,6 @@ _dd_safe() {
   __ddsafe_stats_in_partial="${__ddsafe_stats_in#*+}"
   _errecho "IN:  $(($__ddsafe_stats_in_whole * $__ddsafe_bs)) + (${__ddsafe_stats_in_partial} * ?)"
   _errecho "OUT: $(($__ddsafe_stats_out_whole * $__ddsafe_bs)) + (${__ddsafe_stats_out_partial} * ?)"
-  exit
 }
 
 _test_source() {
@@ -331,11 +331,11 @@ _MAIN() {
   fi
 
 total=$((1024 * 1024 * 1024 + 124283))
-#dd status=none ibs=3 obs=7 if=/dev/random 
+#dd status=none ibs=3 obs=7 if=/dev/random
 set +x
 DD_BLOCKFACTOR=1
 DD_IFLAG_FULLBLOCK=
-_dd_safe /dev/random $((2 * 124)) count=2 | pv -bn >/dev/null
+_dd_safe resume-test.20180410T234657-0400.btrfs.split_ad 131283949 count=2 | pv -bn >/dev/null
 exit
 
   # Script arguments
