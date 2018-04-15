@@ -104,102 +104,44 @@ _load_info_file() {
 DD_BLOCKFACTOR=32
 # "_dd_safe $infile[=/dev/stdin|file|...] $blocksize[=$((32 * 1024 * 1024))] [$ddarg...]"
 _dd_safe() {
-  # _dd_safe $count_bytes[=-1] $skip_bytes[=0] $blockbytes[=($countbytes|$skipbytes)]
   # dd always outputs full obs blocks (it will block until it can do so), thus we should leverage that
   # to determine the amount of bytes read by dd's status output of records (we NEVER want a partial!)
-  # dd if=(/dev/stdin|file|?) obs=$blocksize | dd ibs=$blocksize count=? skip=?
-  # Partial or zero read can only happen once, then we're done reading (as the first dd will block until it has an output block to write)
-  # * Blocking also happens for skip if dd input is normalized!
-  # * Count and skip can't both be 0
-
+  # Partial or zero read can only happen once, then we're done reading (as dd will block until it has an output block to write)
   # This function should just do The Right Thing under any circumstance
-  # * if dd doesn't support fullblock we need to normalize the stream (dd obs=? | dd ...) loop and check its output
-  #   or not use count
-  #   * if $skipbytes > 0 we need to read that many bytes to /dev/null before reading $countbytes to stdout
-  # NOTE: busybox dd only reports blocks in and out!
-
-  # Without fullblock (force sync input reads with a pipe):
-  # See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
-  # dd if=$infile obs=$blocksize | dd $ddarg bs=$blocksize
-
-  # With fullblock:
-  # dd $ddarg if=$infile iflag=fullblock bs=$blocksize
+  # * if dd doesn't support fullblock we need to synchronize the input of the main dd (dd obs=$size | dd bs=$size ...)
+  #  See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
 
   __ddsafe_if="${1:-/dev/stdin}"; shift
   __ddsafe_bs="${1:-$((32 * 1024 * 1024))}"; shift
   _test_parse_num "$__ddsafe_bs"
 
   if [ -n "$DD_IFLAG_FULLBLOCK" ]; then
-    dd $__ddsafe_args if="$__ddsafe_if" iflag=fullblock bs=$__ddsafe_bs
+    { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if" "${DD_IFLAG_FULLBLOCK}" bs=$__ddsafe_bs 2>&1 1>&3 \
+                         | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+    } 3>&1
   else
     [ $(($__ddsafe_bs % $DD_BLOCKFACTOR)) -eq 0 ] || _ERR "_dd_safe: argument 2 (block size) must be a multiple of $DD_BLOCKFACTOR"
-    dd if="$__ddsafe_if" ibs="$(($__ddsafe_bs / $DD_BLOCKFACTOR))" obs=$__ddsafe_bs | dd $__ddsafe_args bs=$__ddsafe_bs
+    { __ddsafe_stats="$(dd if="$__ddsafe_if" ibs="$(($__ddsafe_bs / $DD_BLOCKFACTOR))" obs=$__ddsafe_bs \
+                         | dd "$@" if=/dev/stdin bs=$__ddsafe_bs 2>&1 1>&3 \
+                         | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+    } 3>&1
   fi
 
-  __ddsafe_totalbytes="${1:--1}"; shift # -1 for infinite
-  _test_parse_num "$__ddsafe_totalbytes"
-  #[ $__ddsafe_totalbytes -lt $INTMAX ] || _ERR 'Ambiguous size for total bytes'
-  # TODO: _test_num instead
-
-  __ddsafe_blockbytes="${1:--1}"; shift
-  _test_parse_num "$__ddsafe_blockbytes"
-  [ $__ddsafe_blockbytes -le 0 ] && __ddsafe_blockbytes=$__ddsafe_totalbytes
-
-  __ddsafe_nullretries="${1:--1}"; shift # -1 for infinite
-  _test_parse_num "$__ddsafe_nullretries"
-  # If totalbytes is -1 read until EOF (dd reads 0 bytes)
-  # direct STDOUT of dd to shell STDOUT
-  # direct STDERR of dd to grep/whatever then into variable $__dd_safe_readbytes
-
-  __ddsafe_reads=0
-  __ddsafe_readbytes=0
-  __ddsafe_remaining=0
-  __ddsafe_retrycount=0
-
-  while : ; do
-    if [ $__ddsafe_nullretries -gt 0 ]; then
-      [ $__ddsafe_retrycount -lt $__ddsafe_nullretries ] || { _errecho "WARNING: Partial read"; break; }
-    fi
-
-    if [ $__ddsafe_totalbytes -gt 0 ]; then
-
-      __ddsafe_remaining=$(($__ddsafe_totalbytes - $__ddsafe_readbytes))
-      [ $(($__ddsafe_remaining / $__ddsafe_blockbytes)) -lt 1 ] && __ddsafe_blockbytes=$(($__ddsafe_remaining % $__ddsafe_blockbytes))
-    fi
-    #_errecho "dd bs=${__ddsafe_blockbytes} count=1"
-    { __ddsafe_ddstatus="$(dd bs=${__ddsafe_blockbytes} obs=3 count=1 "$@" 2>&1 1>&3 | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')"; } 3>&1
-    [ -n "$__ddsafe_ddstatus" ] || _ERR 'Failed to parse dd status output'
-    # First line (records in)
-    __ddsafe_records_in="${__ddsafe_ddstatus%% records in"$NL"*}"
-    # Last line (records out)
-    __ddsafe_records_out="${__ddsafe_ddstatus##"${__ddsafe_ddstatus%%"$NL"*}$NL"}"
-    __ddsafe_records_out="${__ddsafe_records_out% records out}"
-    [ ${#__ddsafe_records_in} -eq 3 ] && [ -z "${__ddsafe_records_in#?+?}" ] || _ERR 'Failed to parse dd records in'
-    [ ${#__ddsafe_records_out} -eq 3 ] && [ -z "${__ddsafe_records_out#?+?}" ] || _ERR 'Failed to parse dd records out'
-
-   _errecho "RECORDS: (${__ddsafe_records_in#?+?})"
-    exit
-    __ddsafe_records_out_part="${__ddsafe_records_out_full#*+}"
-    _errecho "IN: ${__ddsafe_records_out_full}+${__ddsafe_records_out_part}"
-    exit
-    __ddsafe_reads=$((__ddsafe_reads + 1))
-    __ddsafe_ddbytes=$((${__ddsafe_ddbytes%% bytes*} + 0))
-
-    #_errecho "READ: $__ddsafe_ddbytes bytes"
-
-    if [ $__ddsafe_ddbytes -le 0 ]; then
-      _errecho "WARNING: 0 byte read"
-      __ddsafe_retrycount=$(($__ddsafe_retrycount + 1))
-      continue
-    fi
-
-    # Read >0 bytes
-    __ddsafe_retrycount=0
-    __ddsafe_readbytes="$(_safe_add $__ddsafe_readbytes $__ddsafe_ddbytes)"
-
-    [ $__ddsafe_readbytes -eq $__ddsafe_totalbytes ] && break
-  done
-  _errecho "Total reads: ${__ddsafe_reads}"
+  # TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
+  # resilient parsing as well as allowing for error checking
+  [ -n "$__ddsafe_stats" ] || _ERR 'Failed to parse dd status output'
+  __ddsafe_stats_in="${__ddsafe_stats%% records in"$NL"*}"
+  __ddsafe_stats_out="${__ddsafe_stats##"${__ddsafe_stats%%"$NL"*}$NL"}"
+  __ddsafe_stats_out="${__ddsafe_stats_out% records out}"
+  [ ${#__ddsafe_stats_in} -eq 3 ]  && [ -z "${__ddsafe_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
+  [ ${#__ddsafe_stats_out} -eq 3 ] && [ -z "${__ddsafe_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
+  __ddsafe_stats_out_whole="${__ddsafe_stats_out%+*}"
+  __ddsafe_stats_out_partial="${__ddsafe_stats_out#*+}"
+  __ddsafe_stats_in_whole="${__ddsafe_stats_out%+*}"
+  __ddsafe_stats_in_partial="${__ddsafe_stats_in#*+}"
+  _errecho "IN:  $(($__ddsafe_stats_in_whole * $__ddsafe_bs)) + (${__ddsafe_stats_in_partial} * ?)"
+  _errecho "OUT: $(($__ddsafe_stats_out_whole * $__ddsafe_bs)) + (${__ddsafe_stats_out_partial} * ?)"
+  exit
 }
 
 _test_source() {
@@ -388,6 +330,14 @@ _MAIN() {
     # TODO Feature-test findmnt
   fi
 
+total=$((1024 * 1024 * 1024 + 124283))
+#dd status=none ibs=3 obs=7 if=/dev/random 
+set +x
+DD_BLOCKFACTOR=1
+DD_IFLAG_FULLBLOCK=
+_dd_safe /dev/random $((2 * 124)) count=2 | pv -bn >/dev/null
+exit
+
   # Script arguments
   source_info="${1-}"
   target="${2-}"
@@ -456,10 +406,6 @@ _MAIN() {
 
   exit 0
 }
-
-total=$((1024 * 1024 * 1024 + 124283))
- dd status=none bs=1GiB if=/dev/urandom | _dd_safe $total $((1024 * 1024 * 512)) 5 | dd status=none bs=128M of=/dev/null
-exit
 
 _MAIN "$@"
 
