@@ -13,21 +13,27 @@ set -eu # exit on error, error on unset
 : "${BLOCKSIZE:=$((64 * 1024 * 1024))}" # BLOCKSIZE=$((1024 * 1024 * 1024)) btrbk-restore-raw ...
 BLOCKSIZE=$(($BLOCKSIZE + 0))
 
-# Newline character (for use in parameter substitution)
+# Newline character constant (for use in parameter substitution)
 NL='
 ';
+# IEC byte multiple constants
+KiB=1024; MiB=$((1024 * KiB)); GiB=$((1024 * MiB)); TiB=$((1024 * GiB)); PiB=$((1024 * TiB))
+# SI byte multiple constants
+ KB=1000;  MB=$((1000 * KB));   GB=$((1000 * MB));   TB=$((1000 * GB));   PB=$((1000 * TB))
 
+# Determine if a string is parseable as an signed integer
+_test_parse_int() { ( [ $((${1#+} + 0)) = "${1#+}" ] ) 2>/dev/null; }
+# Determine maximum number value and set INTMAX constant
 # POSIX specifies only signed long C ints for arithmetic expansion $(())
-if 2>/dev/null [ "$((9223372036854775807 + 0))" = '9223372036854775807' ]; then
+if _test_parse_int '9223372036854775807'; then
   INTMAX=9223372036854775807 # SInt64
-elif 2/dev/null [ "$((2147483647 + 0))" = '2147483647' ]; then
+elif _test_parse_int '2147483647'; then
   INTMAX=2147483647 # SInt32
   _errecho "WARNING: This system only supports file sizes <2GB"
 else
-  _ERR "This system doesn't support signed integers >= 32 bits"
+  _ERR "This system doesn't seem to support signed integers >= 32 bits"
 fi
 
-_test_parse_num() { 2>/dev/null [ $(($1 + 0)) = "$1" ]; }
 
 # Add two positive numbers without overflows
 _safe_add() {
@@ -37,8 +43,8 @@ _safe_add() {
   # * If both negative ensure result is not > 0
   # * If mixed ensure result is not > than the positive one
   # Validate operands using test (triggers error on overflow)
-  _test_parse_num "$1" || _ERR "_safe_add: Failed parsing operand 1 (overflow?): ${1}"
-  _test_parse_num "$2" || _ERR "_safe_add: Failed parsing operand 2 (overflow?): ${2}"
+  _test_parse_int "$1" || _ERR "_safe_add: Failed parsing operand 1 (overflow?): ${1}"
+  _test_parse_int "$2" || _ERR "_safe_add: Failed parsing operand 2 (overflow?): ${2}"
   # Validate result
   [ $(($1 + $2 < 0)) -eq 1 ] && _ERR "_safe_add: Overflow in (${1} + ${2})"
   printf '%d' $(($1 + $2))
@@ -55,7 +61,7 @@ _errecho() { >&2 _echo "$@"; }
 echo() { _ERR "Use _echo instead of echo"; }
 
 # "_str_contains $haystack $needle" - returns 0 if $needle is contained in $haystack, ex: if _str_contains abc b; ...
-_str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*$2*}" ]; }
+_str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*"${2}"*}" ]; }
 
 # "_trap $callback $signal..." - passes $signal as argument 1 to $callback, var prefix: "__trap_", ex: _trap 'echo $1' INT TERM EXIT
 _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
@@ -103,9 +109,13 @@ _load_info_file() {
   } < "$1"; unset __ldinfo_k __ldinfo_v
 }
 
-DD_BLOCKFACTOR=32
-# "_dd_safe $ddarg..."
-_dd_safe() {
+#DD_BLOCKFACTOR=32 let user specify as we enforce the middle buffer later
+_dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++'; }
+_dd_listadd() { printf '%s%s' "${1:+"${1},"}" "$2"; }
+_dd_listrem() { __ddlrem_a="${1#*"${2}"},${1%"${2}"*}"; __ddlrem_a="${__ddlrem_a##,}"; printf '%s' "${__ddlrem_a%%,}"; unset __ddlrem_a; }
+# Like performing _str_contains but checks comma boundaries to ensure that the search value isn't a substring of another value
+_dd_listhas() { [ -n "$1" ] && [ -n "$2" ] && { [ "$1" = "$2" ] || [ -z "${1##*"${2},"*}" ] || [ -z "${1##*"${2},"*}" ]; }; }
+_dd() {
   # dd always outputs full obs blocks (it will block until it can do so), thus we should leverage that
   # to determine the amount of bytes read by dd's status output of records (we NEVER want a partial!)
   # Partial or zero read can only happen once, then we're done reading (as dd will block until it has an output block to write)
@@ -113,104 +123,129 @@ _dd_safe() {
   # * if dd doesn't support fullblock we need to synchronize the input of the main dd (dd obs=$size | dd bs=$size ...)
   #  See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
 
-  __ddsafe_emu_fullblock=0
-  __ddsafe_emu_skipbytes=0
-  __ddsafe_emu_countbytes=0
-  # Defaults
-  __ddsafe_if=/dev/stdin
-  __ddsafe_of=/dev/stdout
+  __dd_emu_fullblock=0
+  __dd_emu_skipbytes=0
+  __dd_emu_countbytes=0
   # Parse args
-  for __ddsafe_a in "$@"; do
-    _errecho ">>$__ddsafe_a"
-    case "$__ddsafe_a" in
-      if=*)       __ddsafe_if="${__ddsafe_a#if=}" ;;
-      of=*)       __ddsafe_of="${__ddsafe_a#of=}" ;;
-      ibs=*)     __ddsafe_ibs="${__ddsafe_a#ibs=}" ;;
-      obs=*)     __ddsafe_obs="${__ddsafe_a#obs=}" ;;
-      bs=*)       __ddsafe_bs="${__ddsafe_a#bs=}" ;;
-      count=*) __ddsafe_count="${__ddsafe_a#count=}" ;;
-      skip=*)   __ddsafe_skip="${__ddsafe_a#skip=}" ;;
-      seek=*)   __ddsafe_seek="${__ddsafe_a#seek=}" ;;
-      conv=*)   __ddsafe_conv="${__ddsafe_conv:+"${__ddsafe_conv},"}${__ddsafe_a#conv}" ;;
-      iflag=*) __ddsafe_iflag="${__ddsafe_iflag:+"${__ddsafe_iflag},"}${__ddsafe_a#iflag=}" ;;
-      oflag=*) __ddsafe_oflag="${__ddsafe_oflag:+"${__ddsafe_oflag},"}${__ddsafe_a#oflag=}" ;;
-      *) _ERR "Unsupported dd arg: $__ddsafe_a"
+  for __dd_a in "$@"; do
+    _errecho ">>$__dd_a"
+    # TODO Check dd help text for existence of option or err
+    case "$__dd_a" in
+      if=*)       __dd_if="${__dd_a#if=}" ;;
+      of=*)       __dd_of="${__dd_a#of=}" ;;
+      ibs=*)     __dd_ibs="${__dd_a#ibs=}" ;;
+      obs=*)     __dd_obs="${__dd_a#obs=}" ;;
+      bs=*)       __dd_bs="${__dd_a#bs=}" ;;
+      count=*) __dd_count="${__dd_a#count=}" ;;
+      skip=*)   __dd_skip="${__dd_a#skip=}" ;;
+      seek=*)   __dd_seek="${__dd_a#seek=}" ;;
+      conv=*)   __dd_conv="$(_dd_listadd "$__dd_conv"  "${__dd_a#conv=}")" ;;
+      iflag=*) __dd_iflag="$(_dd_listadd "$__dd_iflag" "${__dd_a#iflag=}")" ;;
+      oflag=*) __dd_oflag="$(_dd_listadd "$__dd_oflag" "${__dd_a#oflag=}")" ;;
+      status=*) _ERR "Setting status= value is not supported (use pv instead)" ;;
+      *) _ERR "Unsupported dd arg: $__dd_a"
     esac
   done
 
   # Validate size options (NOTE: all must be byte|count values, no suffixes!)
-  [ ${__ddsafe_ibs+isset} = isset ]   && _test_parse_num "$__ddsafe_ibs"
-  [ ${__ddsafe_obs+isset} = isset ]   && _test_parse_num "$__ddsafe_obs"
-  [ ${__ddsafe_bs+isset} = isset ]    && _test_parse_num "$__ddsafe_bs"
-  [ ${__ddsafe_count+isset} = isset ] && _test_parse_num "$__ddsafe_count"
-  [ ${__ddsafe_skip+isset} = isset ]  && _test_parse_num "$__ddsafe_skip"
-  [ ${__ddsafe_seek+isset} = isset ]  && _test_parse_num "$__ddsafe_seek"
+  [   ${__dd_ibs:+isset} = isset ] && _test_parse_int "$__dd_ibs"
+  [   ${__dd_obs:+isset} = isset ] && _test_parse_int "$__dd_obs"
+  [    ${__dd_bs:+isset} = isset ] && _test_parse_int "$__dd_bs"
+  [ ${__dd_count:+isset} = isset ] && _test_parse_int "$__dd_count"
+  [  ${__dd_skip:+isset} = isset ] && _test_parse_int "$__dd_skip"
+  [  ${__dd_seek:+isset} = isset ] && _test_parse_int "$__dd_seek"
   # Normalize list options (item[,...]) to remove duplicates and null items (,,[,...])
-  if [ ${__ddsafe_conv+isset} = isset ]; then
-     __ddsafe_conv="conv=$(echo "$__ddsafe_conv" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
-     __ddsafe_args="${__ddsafe_ddargs} conv=${__ddsafe_conv}"
+  if [ ${__dd_conv:+isset} = isset ]; then
+     __dd_conv="$(_dd_listnorm "$__dd_conv")"
   fi
-  if [ ${__ddsafe_iflag+isset} = isset ];
-    __ddsafe_iflag="iflag=$(echo "$__ddsafe_iflag" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
-    if _str_contains "$__ddsafe_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -eq 1 ]; then
-      __ddsafe_emu_fullblock=1
-      __ddsafe_a="${__ddsafe_iflag#iflag=}"
-      __ddsafe_a="${__ddsafe_a#*fullblock},${__ddsafe_a%fullblock*}"
-      __ddsafe_a="${__ddsafe_a##,}"
-      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+  if [ ${__dd_iflag:+isset} = isset ];
+    __dd_iflag="$(_dd_listnorm "$__dd_iflag")"
+    if _dd_listhas "$__dd_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -ne 1 ]; then
+      __dd_emu_fullblock=1
+      __dd_iflag="$(_dd_listrem "$__dd_iflag" fullblock)"
     fi
-    if _str_contains "$__ddsafe_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -eq 1 ]; then
-      __ddsafe_emu_skipbytes=1
-      __ddsafe_a="${__ddsafe_iflag#iflag=}"
-      __ddsafe_a="${__ddsafe_a#*skip_bytes},${__ddsafe_a%skip_bytes*}"
-      __ddsafe_a="${__ddsafe_a##,}"
-      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+    if _dd_listhas "$__dd_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -ne 1 ]; then
+      __dd_emu_skipbytes=1
+      __dd_iflag="$(_dd_listrem "$__dd_iflag" skip_bytes)"
     fi
-    if _str_contains "$__ddsafe_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -eq 1 ]; then
-      __ddsafe_emu_countbytes=1
-      __ddsafe_a="${__ddsafe_iflag#iflag=}"
-      __ddsafe_a="${__ddsafe_a#*count_bytes},${__ddsafe_a%count_bytes*}"
-      __ddsafe_a="${__ddsafe_a##,}"
-      __ddsafe_iflag="iflag=${__ddsafe_a%%,}"
+    if _dd_listhas "$__dd_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -ne 1 ]; then
+      __dd_emu_countbytes=1
+      __dd_iflag="$(_dd_listrem "$__dd_iflag" count_bytes)"
     fi
   fi
-  if [ ${__ddsafe_oflag+isset} = isset ]; then
-     __ddsafe_oflag="oflag=$(echo "$__ddsafe_oflag" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++')"
+  if [ ${__dd_oflag:+isset} = isset ]; then
+     __dd_oflag="$(_dd_listnorm "$__dd_oflag")"
   fi
 
   # TODO Emulate skip_bytes and count_bytes
   # if not has skip_bytes or count_bytes then run in a loop
 
-  #__ddsafe_optargs="${__ddsafe_conv:+"conv=${__ddsafe_conv}"}${__ddsafe_iflag:+"iflag=${__ddsafe_iflag}"}${__ddsafe_oflag:+"${__ddsafe_oflag"}"
-
   # while : ; do
-    if [ $__ddsafe_emu_fullblock -eq 1 ]; then
-      # [ ${__ddsafe_conv:+isset} = isset ] && __ddsafe_args="${__ddsafe_ddargs} conv=${__ddsafe_conv}"
+    if [ $__dd_emu_fullblock -eq 1 ]; then
+      # Notes about dd's buffering/blocking behavior:
+      # * For GNU dd bs= always takes precedence over ibs= and obs=; for BusyBox (and others?) it's positional
+      #   We should adhere to the GNU standard as it's easier to implement and this func is essentially a shim for GNU dd
+      # * Unless bs= or obs= is set dd will write what its read call returned (up to ibs bytes)
+      # * If ibs > obs dd will write up to ibs bytes per read regardless of obs! (can this be modified with a conv= option?)
+      # * Because count= and skip= *limit* INPUT BLOCKS which can ALWAYS be PARTIAL READS/SKIPS the only way to ensure
+      #   an arbitrary number of bytes/ibs-sized blocks are skipped/written out is to use iflag=fullblock or buffer dd with another
+      #   by matching obs of first to ibs of second (as first dd will block until either a full output block (of obs= or bs= size)
+      #   is ready to write, or EOF from input)
+      # We need to place a buffer of a known size between the input and output using another instance of dd
+      # Never set bs= on the first dd!
+      # cbs=, *conv=, skip=, count=, ibs=, if=, and iflag= apply to first
+      # *conv=, seek=, obs=, of=, and oflag= apply to second
+      # ibs=1M bs=3M count=2
+      # TODO:
+      # What to set block size to if unset as we need to sync on a value? Probably set to 512, to be safe unless
+      # there's an easy, portable way to check _POSIX_PIPE_BUF or PIPE_BUF from limits.h
       _errecho "WARNING: Emulating dd iflag=fullblock"
-      { __ddsafe_stats="$(dd status=none if="$__ddsafe_if" ibs="${__ddsafe_ibs:-${__ddsafe_bs#bs=}}" obs="$__ddsafe_bs" \
-                          | dd "$@" if=/dev/stdin of="$__ddsafe_of" bs="$__ddsafe_bs" 2>&1 1>&3 \
-                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+      __dd_a=
+      if [ ${__dd_conv:+isset} = isset ]; then
+        # Remove conv= options that apply to of= and add them to a seperate list for second dd
+        for __dd_a in excl nocreat notrunc fdatasync fsync; do
+          _dd_listhas "$__dd_conv" $__dd_a || continue
+          __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
+          __dd_bufd_conv="$(_dd_listadd "${__dd_bufd_conv-}" $__dd_a)"
+        done
+      fi
+      { __dd_stats="$( \
+          dd status=none obs="${__dd_bs:-512}" ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"} \
+            ${__dd_skip:+skip="$__dd_skip"} \
+            ${__dd_ibs:+ibs="$__dd_ibs"} ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
+          | 2>&1 1>&3 dd bs="$__dd_bs" ${__dd_bufd_conv:+conv="$__dd_bufd_conv"} \
+            ${__dd_count:+count="$__dd_count"} ${__dd_seek:+seek="$__dd_seek"} \
+            ${__dd_ibs:+obs="$__dd_obs"} ${__dd_of:+of="$__dd_of"} ${__dd_oflag:+oflag="$__dd_oflag"} \
+        )";
       } 3>&1
     else
-      { __ddsafe_stats="$(dd "$@" if="$__ddsafe_if" iflag= bs=$__ddsafe_bs 2>&1 1>&3 \
-                          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$')";
+      { __dd_stats="$( \
+          2>&1 1>&3 dd ${__dd_bs:+bs="$__dd_bs"} ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"} \
+            ${__dd_count:+count="$__dd_count"} ${__dd_skip:+skip="$__dd_skip"} ${__dd_seek:+seek="$__dd_seek"} \
+            ${__dd_ibs:+ibs="$__dd_ibs"} ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
+            ${__dd_ibs:+obs="$__dd_obs"} ${__dd_of:+of="$__dd_of"} ${__dd_oflag:+oflag="$__dd_oflag"} \
+        )";
       } 3>&1
     fi
 
+    _errecho "$__dd_stats"
+    exit
+
+#          | grep -m 2 '^[0-9]\++[0-9]\+ records \(in\|out\)$' \
     # TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
     # resilient parsing as well as allowing for error checking
-    [ -n "$__ddsafe_stats" ] || _ERR 'Failed to parse dd status output'
-    __ddsafe_stats_in="${__ddsafe_stats%% records in"$NL"*}"
-    __ddsafe_stats_out="${__ddsafe_stats##"${__ddsafe_stats%%"$NL"*}$NL"}"
-    __ddsafe_stats_out="${__ddsafe_stats_out% records out}"
-    [ ${#__ddsafe_stats_in} -eq 3 ]  && [ -z "${__ddsafe_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
-    [ ${#__ddsafe_stats_out} -eq 3 ] && [ -z "${__ddsafe_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
-    __ddsafe_stats_out_whole="${__ddsafe_stats_out%+*}"
-    __ddsafe_stats_out_partial="${__ddsafe_stats_out#*+}"
-    __ddsafe_stats_in_whole="${__ddsafe_stats_out%+*}"
-    __ddsafe_stats_in_partial="${__ddsafe_stats_in#*+}"
-    _errecho "IN:  $(($__ddsafe_stats_in_whole * $__ddsafe_bs)) + (${__ddsafe_stats_in_partial} * ?)"
-    _errecho "OUT: $(($__ddsafe_stats_out_whole * $__ddsafe_bs)) + (${__ddsafe_stats_out_partial} * ?)"
+    [ -n "$__dd_stats" ] || _ERR 'Failed to parse dd status output'
+    __dd_stats_in="${__dd_stats%% records in"$NL"*}"
+    __dd_stats_out="${__dd_stats##"${__dd_stats%%"$NL"*}$NL"}"
+    __dd_stats_out="${__dd_stats_out% records out}"
+    [ ${#__dd_stats_in} -eq 3 ]  && [ -z "${__dd_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
+    [ ${#__dd_stats_out} -eq 3 ] && [ -z "${__dd_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
+    __dd_stats_out_whole="${__dd_stats_out%+*}"
+    __dd_stats_out_partial="${__dd_stats_out#*+}"
+    __dd_stats_in_whole="${__dd_stats_out%+*}"
+    __dd_stats_in_partial="${__dd_stats_in#*+}"
+    _errecho "IN:  $(($__dd_stats_in_whole * $__dd_bs)) + (${__dd_stats_in_partial} * ?)"
+    _errecho "OUT: $(($__dd_stats_out_whole * $__dd_bs)) + (${__dd_stats_out_partial} * ?)"
   # done
 }
 
@@ -405,7 +440,7 @@ total=$((1024 * 1024 * 1024 + 124283))
 set +x
 DD_BLOCKFACTOR=1
 DD_IFLAG_FULLBLOCK=0
-_dd_safe if=resume-test.20180410T234657-0400.btrfs.split_ad bs=131283949 count=2 | pv -bn >/dev/null
+_dd if=resume-test.20180410T234657-0400.btrfs.split_ad bs=131283949 count=2 | pv -bn >/dev/null
 exit
 
   # Script arguments
