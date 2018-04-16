@@ -110,8 +110,7 @@ _load_info_file() {
 }
 
 #DD_BLOCKFACTOR=32 let user specify as we enforce the middle buffer later
-_dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} $0!="" && !seen[$0]++'; }
-# awk 'BEGIN{RS=ORS=",";y=""} {if ($1!=""&&!seen[$1]++) {ORS=y;print s;y=";";s=$0}} END{ORS="";print s}' # No trailing comma
+_dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} {if($1!=""&&!seen[$1]++){ORS=y;print s;y=";";s=$1}} END{ORS="";print s}'; }
 _dd_listadd() { printf '%s%s' "${1:+"${1},"}" "$2"; }
 _dd_listrem() { __ddlrem_a="${1#*"${2}"},${1%"${2}"*}"; __ddlrem_a="${__ddlrem_a##,}"; printf '%s' "${__ddlrem_a%%,}"; unset __ddlrem_a; }
 # Like performing _str_contains but checks comma boundaries to ensure that the search value isn't a substring of another value
@@ -124,13 +123,16 @@ _dd() {
   # * if dd doesn't support fullblock we need to synchronize the input of the main dd (dd obs=$size | dd bs=$size ...)
   #  See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
 
+  # Default input and output block size values (POSIX >= 512, Linux = >=4096)
+  __dd_ibs=4096
+  __dd_obs=4096
+
   __dd_emu_fullblock=0
   __dd_emu_skipbytes=0
   __dd_emu_countbytes=0
+  __dd_emu_seekbytes=0
   # Parse args
   for __dd_a in "$@"; do
-    _errecho ">>$__dd_a"
-    # TODO Check dd help text for existence of option or err
     case "$__dd_a" in
       if=*)       __dd_if="${__dd_a#if=}" ;;
       of=*)       __dd_of="${__dd_a#of=}" ;;
@@ -144,7 +146,7 @@ _dd() {
       iflag=*) __dd_iflag="$(_dd_listadd "${__dd_iflag-}" "${__dd_a#iflag=}")" ;;
       oflag=*) __dd_oflag="$(_dd_listadd "${__dd_oflag-}" "${__dd_a#oflag=}")" ;;
       status=*) _ERR "Setting status= value is not supported (use pv instead)" ;;
-      *) _ERR "Unsupported dd arg: $__dd_a"
+      *) _ERR "Unsupported dd parameter: $__dd_a"
     esac
   done
 
@@ -165,52 +167,102 @@ _dd() {
       __dd_emu_fullblock=1
       __dd_iflag="$(_dd_listrem "$__dd_iflag" fullblock)"
     fi
-    if _dd_listhas "$__dd_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -ne 1 ]; then
-      __dd_emu_skipbytes=1
-      __dd_iflag="$(_dd_listrem "$__dd_iflag" skip_bytes)"
-    fi
     if _dd_listhas "$__dd_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -ne 1 ]; then
       __dd_emu_countbytes=1
       __dd_iflag="$(_dd_listrem "$__dd_iflag" count_bytes)"
     fi
+    if _dd_listhas "$__dd_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -ne 1 ]; then
+      __dd_emu_skipbytes=1
+      __dd_iflag="$(_dd_listrem "$__dd_iflag" skip_bytes)"
+    fi
   fi
   if [ -n "${__dd_oflag:+isset}" ]; then
      __dd_oflag="$(_dd_listnorm "$__dd_oflag")"
+    if _dd_listhas "$__dd_oflag" seek_bytes && [ $DD_OFLAG_SEEKBYTES -ne 1 ]; then
+      __dd_emu_seekbytes=1
+      __dd_oflag="$(_dd_listrem "$__dd_oflag" seek_bytes)"
+    fi
   fi
 
-  if [ $__dd_emu_fullblock -eq 1 ]; then
-    # Notes about dd's buffering/blocking behavior:
-    # * For GNU dd bs= always takes precedence over ibs= and obs=; for BusyBox (and others?) it's positional
-    #   We should adhere to the GNU standard as it's easier to implement and this func is essentially a shim for GNU dd
-    # * Unless bs= or obs= is set dd will write what its read call returned (up to ibs bytes)
-    # * If ibs > obs dd will write up to ibs bytes per read regardless of obs! (can this be modified with a conv= option?)
-    # * Because count= and skip= *limit* INPUT BLOCKS which can ALWAYS be PARTIAL READS/SKIPS the only way to ensure
-    #   an arbitrary number of bytes/ibs-sized blocks are skipped/written out is to use iflag=fullblock or buffer dd with another
-    #   by matching obs of first to ibs of second (as first dd will block until either a full output block (of obs= or bs= size)
-    #   is ready to write, or EOF from input)
-    # We need to place a buffer of a known size between the input and output using another instance of dd
-    # Never set bs= on the first dd!
-    # cbs=, *conv=, skip=, count=, ibs=, if=, and iflag= apply to first
-    # *conv=, seek=, obs=, of=, and oflag= apply to second
-    # ibs=1M bs=3M count=2
-    # TODO:
-    # What to set block size to if unset as we need to sync on a value? Probably set to 512, to be safe unless
-    # there's an easy, portable way to check _POSIX_PIPE_BUF or PIPE_BUF from limits.h
-    # Emulate skip_bytes and count_bytes -- if dd ! has skip_bytes or count_bytes then run in a loop
-    _errecho "WARNING: Emulating GNU dd iflag=fullblock"
-    __dd_a=
-    if [ -n "${__dd_conv:+isset}" ]; then
-      # Remove conv= options that apply to the output blocks and file, then add them to a seperate list for second dd
-      for __dd_a in excl nocreat notrunc fdatasync fsync; do
-        _dd_listhas "$__dd_conv" $__dd_a || continue
-        __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
-        __dd_bufd_conv="$(_dd_listadd "${__dd_bufd_conv-}" $__dd_a)"
-      done
-    fi
-    __dd_def_bs=512
+
+  # skip_bytes/count_bytes emulation
+  # 1) skip=1 count=0 with ibs=$((skip_bytes % ibs)) (if > 0)
+  # 2) skip=$((skip_bytes / $ibs)) count=$((count_bytes / $ibs))
+  # 3) skip=0 count=1 with ibs=$((count_bytes % ibs)) (if > 0)
+  # 4) ...? seek? how to? can we maybe just set obs=seek_bytes and seek=1 ???
+  #    We can't really call dd more than once to seek if working on an of=$file
+  #    Seek emulation seems impractical as obs can't be set to an arbitrarily large size
+  #    The only way I can think of is to chop up the seek_bytes value into obs sized chunks; first reading from the last
+  #    chunk through the remainder, piping that into the seeking/end dd while it seeks the chunks then writes that, then continues
+  #    writing from the earlier pipe dd1 | { dd ibs=$obs if=$of skip=$seek count= | dd3 obs= of=$of seek= }
+  #    TOO COMPLICATED FOR NOW, we should just implement count_bytes and skip_bytes at any rate
+
+  # TODO: Wrap function in subshell?
+
+  # if=/dev/random bs=4 skip_bytes=14 count_bytes=17 seek_bytes=15
+  # for iflag=fullblock we might need to call this function again (make sure it's converted to subshell first!)
+  #
+  # seek_bytes emulation:
+  # seek=15 bs=4
+  #   seek to arbitrary pos     now read remainder before real input          real input        output (might should be a _dd call
+  #                             (this dd *might* read partial blocks!)                          (skip/count here)   to support fullbock)
+  # { tail -c $((15/4=3)) $of | dd ibs=$((15%4+1=4)) obs=$((15%4=3)) count=1; dd if=$if ... } | dd ibs=$bs obs=$bs seek=$((15/4=3)) of=$of
+  #
+  # skip_bytes emulation:
+  # skip=14 bs=4
+  # { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0; dd ibs=$bs obs=$bs skip=$((14/4=3)) } <$if
+  #
+  # count_bytes emulation
+  # count=17 bs=4
+  # { dd ibs=$bs obs=$bs count=$((17/4=4)); $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
+  #
+  # How to mix them?
+  # count & skip
+  # { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0;
+  #   dd ibs=$bs obs=$bs skip=$((14/4=3)) count=$((17/4=4));
+  #   $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
+  #
+  # Maybe we should assign different fds to each step and background them then wait for pids?
+  # Might make implementation easier and remove need for eval or named pipes
+  #
+  # skip_bytes/count_bytes emulation
+  # 1) skip=1 count=0 with ibs=$((skip_bytes % ibs)) (if > 0)
+  # 2) skip=$((skip_bytes / $ibs)) count=$((count_bytes / $ibs))
+  # 3) skip=0 count=1 with ibs=$((count_bytes % ibs)) (if > 0)
+
+  if $(($__dd_emu_countbytes + $__dd_emu_skipbytes + $__dd_emu_seekbytes > 0)); then
+    _errecho "WARNING: Emulating GNU dd iflag=(count|skip)_bytes/oflag=seek_bytes"
+
+
     while : ; do
+      if [ $__dd_emu_fullblock -eq 1 ]; then
+        _errecho "WARNING: Emulating GNU dd iflag=fullblock"
+        # Notes about dd's buffering/blocking behavior:
+        # * For GNU dd bs= always takes precedence over ibs= and obs=; for BusyBox (and others?) it's positional
+        #   We should adhere to the GNU standard as it's easier to implement and this func is essentially a shim for GNU dd
+        # * Unless bs= or obs= is set dd will write what its read call returned (up to ibs bytes)
+        # * If ibs > obs dd will write up to ibs bytes per read regardless of obs! (can this be modified with a conv= option?)
+        # * Because count= and skip= *limit INPUT BLOCKS* which can ALWAYS be PARTIAL READS/SKIPS the only way to ensure
+      #   an arbitrary number of bytes/ibs-sized blocks are skipped/written out is to use iflag=fullblock or buffer dd with another
+      #   by matching obs of first to ibs of second (as first dd will block until either a full output block (of obs= or bs= size)
+      #   is ready to write, or EOF from input)
+      # We need to place a buffer of a known size between the input and output using another instance of dd
+      # Never set bs= on the first dd!
+      # cbs=, *conv=, skip=, count=, ibs=, if=, and iflag= apply to first
+      # *conv=, seek=, obs=, of=, and oflag= apply to second
+
+      __dd_a=
+      if [ -n "${__dd_conv:+isset}" ]; then
+        # Remove conv= options that apply to the output blocks and file, then add them to a seperate list for second dd
+        for __dd_a in excl nocreat notrunc fdatasync fsync; do
+          _dd_listhas "$__dd_conv" $__dd_a || continue
+          __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
+          __dd_bufd_conv="$(_dd_listadd "${__dd_bufd_conv-}" $__dd_a)"
+        done
+      fi
+      __dd_def_bs=512
       # NOTE: BusyBox dd will write a partial output block if ibs is equal to obs, therefore we set first dd ibs=obs+1
-      { __dd_stats="$( \
+      { __dd_stats="$( [ $TRACE -eq 1 ] && set -x; \
           dd status=none ibs="$((${__dd_bs:-${__dd_ibs:-${__dd_def_bs}}} + 1))" obs="${__dd_bs:-${__dd_ibs:-${__dd_def_bs}}}" \
             ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"} \
             ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
@@ -239,12 +291,7 @@ _dd() {
       break # TODO REMOVE --------------------------------********************************************
     done
   else
-    _errecho 'Using GNU dd'
-    _errecho "dd ${__dd_bs:+bs="$__dd_bs"} ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"}
-          ${__dd_count:+count="$__dd_count"} ${__dd_skip:+skip="$__dd_skip"} ${__dd_seek:+seek="$__dd_seek"}
-          ${__dd_ibs:+ibs="$__dd_ibs"} ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"}
-          ${__dd_ibs:+obs="$__dd_obs"} ${__dd_of:+of="$__dd_of"} ${__dd_oflag:+oflag="$__dd_oflag"}"
-    { __dd_stats="$( \
+    { __dd_stats="$( [ $TRACE -eq 1 ] && set -x; \
         2>&1 1>&3 dd ${__dd_bs:+bs="$__dd_bs"} ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"} \
           ${__dd_count:+count="$__dd_count"} ${__dd_skip:+skip="$__dd_skip"} ${__dd_seek:+seek="$__dd_seek"} \
           ${__dd_ibs:+ibs="$__dd_ibs"} ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
@@ -419,12 +466,14 @@ _MAIN() {
   DD_IFLAG_FULLBLOCK=0
   DD_IFLAG_SKIPBYTES=0
   DD_IFLAG_COUNTBYTES=0
+  DD_OFLAG_SEEKBYTES=0
   dd_helptxt="$(dd --help 2>&1)" \
   || dd_helptxt="$(dd -h 2>&1)" \
   || _ERR "Failed to parse help text for dd"
   _str_contains "$dd_helptxt" fullblock   && DD_IFLAG_FULLBLOCK=1
   _str_contains "$dd_helptxt" skip_bytes  && DD_IFLAG_SKIPBYTES=1
   _str_contains "$dd_helptxt" count_bytes && DD_IFLAG_COUNTBYTES=1
+  _str_contains "$dd_helptxt" seek_bytes  && DD_OFLAG_SEEKBYTES=1
 
   if [ "$INPLACE" -eq 1 ]; then
     _require_bin fallocate  util-linux
@@ -444,7 +493,7 @@ total=$((1024 * 1024 * 1024 + 124283))
 #dd status=none ibs=3 obs=7 if=/dev/random
 set +x
 DD_BLOCKFACTOR=1
-DD_IFLAG_FULLBLOCK=1
+DD_IFLAG_FULLBLOCK=0
 _dd if=/dev/random iflag=fullblock bs=$((1 * KiB)) count=2 | pv -bn >/dev/null
 exit
 
