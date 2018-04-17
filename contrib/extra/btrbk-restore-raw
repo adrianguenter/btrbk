@@ -114,6 +114,15 @@ _load_info_file() {
   } < "$1"; unset __ldinfo_k __ldinfo_v
 }
 
+# Portable mktemp -u; tries to use "$TMPDIR", then "/tmp", then "." or returns 1
+_tempname() (
+  for _ in "${TMPDIR-}" /tmp .; do [ -d "$_" ] && [ -w "$_" ] && { dir="$_"; break; }; done; [ -z ${dir+set} ] && return 1
+  while :; do path="${dir}/${1-"tmp."}$(od -An -N5 -tx1 /dev/urandom | tr -d ' ')"; [ -e "$path" ] || break; done
+  printf %s "$path"
+)
+_mktemp() ( path="$(_tempname ${1+"$1"})"; umask 0177 && touch "$path" || return 1; printf %s "$path"; )
+_mktempd() ( path="$(_tempname ${1+"$1"})"; mkdir -m 0700 "$path" || return 1; printf %s "$path"; )
+
 # Outputs a normalized version of a list ("a,f,b,,,c,d,,b,,e,f" => "a,f,b,c,d,e")
 _dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} {if($1!=""&&!seen[$1]++){ORS=y;print s;y=",";s=$1}} END{ORS="";print s}'; }
 _dd_listadd() { _dd_listhas "$1" "$2" && printf '%s' "$1" || printf '%s%s' "${1:+"${1},"}" "$2"; }
@@ -214,6 +223,9 @@ _dd() {
   fi
   # NOTE: All lists (conv,iflag,oflag) are safe to traverse and eval unquoted below this point as
   # they're checked with _str_only above
+  ERRCHK=1
+  TEST=1
+  #__cmd="dd skip=0 count=0 seek=0${__dd_conv:+ conv="$__dd_conv"}; "
   __cmd=
   __cmd_end=
   if [ $__dd_emu_fullblock -eq 1 ]; then
@@ -255,7 +267,8 @@ _dd() {
   if [ $__dd_emu_skipbytes -eq 1 ]; then
     _errecho "WARNING: Emulating GNU dd iflag: skip_bytes"
     if [ $(($__dd_skip % $__dd_ibs)) -gt 0 ]; then
-      __cmd_skip="dd ibs=$(($__dd_skip % $__dd_ibs))${__dd_iflag:+ iflag="$__dd_iflag"} skip=1 count=0 && "
+      __cmd_skip="${ERRCHK+"skip=\"\$(2>&1 >&3 "}dd ibs=$(($__dd_skip % $__dd_ibs))"
+      __cmd_skip="${__cmd_skip}${__dd_iflag:+ iflag="$__dd_iflag"} skip=1 count=0${ERRCHK+")\""} && "
     fi
     __dd_skip=$(($__dd_skip / $__dd_ibs))
   fi
@@ -265,29 +278,56 @@ _dd() {
   if [ $__dd_emu_countbytes -eq 1 ]; then
     _errecho "WARNING: Emulating GNU dd iflag: count_bytes"
     if [ $(($__dd_count % $__dd_ibs)) -gt 0 ]; then
-      __cmd_count=" && dd ibs=$(($__dd_count % $__dd_ibs))${__dd_iflag:+ iflag="$__dd_iflag"} count=1"
-      __cmd_count="${__cmd_count}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$__dd_conv"}"
+      __cmd_count=" && ${ERRCHK+"count=\"\$(2>&1 1>&3 "}dd ibs=$(($__dd_count % $__dd_ibs))${__dd_iflag:+ iflag="$__dd_iflag"} count=1"
+      __cmd_count="${__cmd_count}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$__dd_conv"}${ERRCHK+")\""}"
     fi
     __dd_count=$(($__dd_count / $__dd_ibs))
   fi
   # Assemble command
   if [ -n "$__cmd_skip$__cmd_count$__cmd_seek" ]; then
     __cmd="${__cmd}{ "
-    __cmd_end="; }${__dd_if:+ <"$__dd_if"}${__dd_of:+ >"$__dd_of"}${__cmd_end}"
+    __cmd_end="; }${__dd_if:+ <"$__dd_if"}${__dd_of:+ >"$__dd_of"}${ERRCHK+" 3>&1"}${__cmd_end}"
     unset __dd_if __dd_of
   fi
+  if [ -n "${TEST+set}" ];then
+  __test_cmd="${ERRCHK+"test=\"\$(2>&1 >/dev/null "}dd${__dd_iflag:+ iflag="$__dd_iflag"} skip=0 count=0 seek=0"
+  __test_cmd="${__test_cmd}${__dd_conv:+ conv="$__dd_conv"}${__dd_oflag:+ oflag="$__dd_oflag"}${ERRCHK+")\""} "
+  __cmd="${__test_cmd} && ${__cmd}"
+  fi
+
   __cmd="${__cmd}${__cmd_seek}${__cmd_skip}${__cmd_seek:+"wait \"\$seekpid\" && "}"
-  __cmd="${__cmd}dd ibs=${__dd_ibs}${__dd_iflag:+ iflag="$__dd_iflag"}${__dd_if:+ if="$__dd_if"}"
+
+  __cmd="${__cmd}${ERRCHK+"main=\"\$(2>&1 >&3 "}dd ibs=${__dd_ibs}${__dd_iflag:+ iflag="$__dd_iflag"}${__dd_if:+ if="$__dd_if"}"
   __cmd="${__cmd}${__dd_skip:+ skip="$__dd_skip"}${__dd_count:+ count="$__dd_count"}${__dd_seek:+ seek="$__dd_seek"}"
   __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$__dd_conv"}"
-  __cmd="${__cmd} obs=${__dd_obs}${__dd_oflag:+ oflag="$__dd_oflag"}${__dd_of:+ of="$__dd_of"}"
+  __cmd="${__cmd} obs=${__dd_obs}${__dd_oflag:+ oflag="$__dd_oflag"}${__dd_of:+ of="$__dd_of"}${ERRCHK+")\""}"
+
   __cmd="${__cmd}${__cmd_count}${__cmd_end}"
 
   _errecho "$ $__cmd"
 
-  # TODO: eval
+  set +e
+  for _ in i; do
+    _errecho eval "$__cmd"; result=$?
+    [ -n "${ERRCHK+set}" ] || exit $result
+  done
+
+  _errecho "SKIP${NL}----${NL}$skip"
+  _errecho "MAIN${NL}----${NL}$main"
+  _errecho "COUNT${NL}----${NL}$count"
 
   # TODO? error handling
+  # stderr can't be captured for the seek dd if we background it (implicit subshell)
+  # we should probably just do away with async seek for this reason unless
+  # we never need to capture it's input (or we can error otherwise if wait returns non-zero)
+
+  # Wrap everything in for loop
+
+ # for _ in 1; do ...; done
+
+  # dd seek= & seekpid=$!; wait "$seekpid" || { echo "SEEK ERROR!"; break; } && dd ...
+
+  # { skip="$(2>&1 1>&3 dd ...)" && main="$(2>&1 1>&3 dd ...)"; } <infile >outfile 3>&1
 }
 
 _test_source() {
