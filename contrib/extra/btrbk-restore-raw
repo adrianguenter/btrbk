@@ -64,13 +64,16 @@ echo() { _ERR "Use _echo instead of echo"; }
 # "_str_contains $haystack $needle" - returns 0 if $needle is contained in $haystack, ex: if _str_contains abc b; ...
 _str_contains() { [ -z "$2" ] || [ -n "$1" ] && [ -z "${1##*"${2}"*}" ]; }
 
+# "_str_only $string $chars" - returns 0 if $1 contains only characters found in $2
+_str_only() { [ -z "$(printf %s "$1" | tr -d "$2")" ]; }
+
 # "_trap $callback $signal..." - passes $signal as argument 1 to $callback, var prefix: "__trap_", ex: _trap 'echo $1' INT TERM EXIT
 _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__trap_s" "$__trap_s"; done; unset __trap_cb __trap_s; }
 
-# "_safe_dquoteval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ and wraps the result in double-quotes for use in eval'd double-quoted strings, ex: eval "echo $(_safe_dquoteval "\$(date)")"
-# WARNING: Do NOT wrap the output of this function in escaped double-quotes at the call site! WRONG: eval "echo \"$(_safe_dquoteval "\$(date)")\""
-# NOTE: != 0 is intentional to ensure string comparison
-_safe_dquoteval() { [ "${2-1}" = 0 ]||printf \"; printf %s "$1" | sed 's/[\\`$"]/\\&/g'; [ "${2-1}" = 0 ]||printf \"; }
+# "_safe_dqval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ and wraps the result in double-quotes for use in eval'd double-quoted strings, ex: eval "echo $(_safe_dqval "\$(date)")"
+# WARNING: Do NOT wrap the output of this function in escaped double-quotes at the call site! WRONG: eval "echo \"$(_safe_dqval "\$(date)")\""
+_safe_dqval() { [ "${2-}" != QUOTE_ALWAYS ] && set "$1" 'f="%s";if(s~/[[:space:]|&;<>()$`\\"]/)' || set "$1" '';
+  printf %s "$1"|awk 'BEGIN{s=""}{gsub(/[\\`$"]/,"\\\\&");if(NR>1){s=s"\n"};s=s$0}END{'"${2-}"'{f="\"%s\""}printf f,s}'; }
 
 # "_safe_eval_setvar $name $value" - validates $name and sanitizes $value using _safe_dquoteval before setting the variable using eval
 _safe_eval_setvar() {
@@ -146,6 +149,7 @@ _dd() {
       of=*)       __dd_of="${__dd_a#of=}" ;;
       ibs=*)     __dd_ibs="${__dd_a#ibs=}" ;;
       obs=*)     __dd_obs="${__dd_a#obs=}" ;;
+      cbs=*)     __dd_cbs="${__dd_a#cbs=}" ;;
       bs=*)       __dd_bs="${__dd_a#bs=}" ;;
       count=*) __dd_count="${__dd_a#count=}" ;;
       skip=*)   __dd_skip="${__dd_a#skip=}" ;;
@@ -176,11 +180,13 @@ _dd() {
   fi
   if [ -n "${__dd_seek:+set}" ]; then _test_parse_int "$__dd_seek" || _ERR "Invalid seek value: $__dd_seek"; fi
 
-  # Normalize list options (item[,...]) to remove duplicates and null items (,,[,...])
+  # Validate and normalize list options (item[,...]) to remove duplicates and null items (,,[,...])
   if [ -n "${__dd_conv:+isset}" ]; then
+     _str_only "$__dd_conv"  '[[:alpha:]]_,' || _ERR  "conv= contains invalid characters: $__dd_conv"
      __dd_conv="$(_dd_listnorm "$__dd_conv")"
   fi
   if [ -n "${__dd_iflag:+isset}" ]; then
+    _str_only "$__dd_iflag" '[[:alpha:]]_,' || _ERR "iflag= contains invalid characters: $__dd_iflag"
     __dd_iflag="$(_dd_listnorm "$__dd_iflag")"
     if { _dd_listhas "$__dd_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -ne 1 ]; }; then
       __dd_iflag="$(_dd_listrem "$__dd_iflag" fullblock)"
@@ -198,6 +204,7 @@ _dd() {
     fi
   fi
   if [ -n "${__dd_oflag:+isset}" ]; then
+     _str_only "$__dd_oflag" '[[:alpha:]]_,' || _ERR "oflag= contains invalid characters: $__dd_oflag"
      __dd_oflag="$(_dd_listnorm "$__dd_oflag")"
     if { _dd_listhas "$__dd_oflag" seek_bytes && [ $DD_OFLAG_SEEKBYTES -ne 1 ]; }; then
       __dd_oflag="$(_dd_listrem "$__dd_oflag" seek_bytes)"
@@ -205,7 +212,9 @@ _dd() {
       [ ${__dd_seek:-0} -gt 0 ] && __dd_emu_seekbytes=1
     fi
   fi
-_errecho "final iflag=$__dd_iflag"
+
+  _errecho "final iflag=$__dd_iflag"
+
   # skip_bytes/count_bytes emulation
   # 1) skip=1 count=0 with ibs=$((skip_bytes % ibs)) (if > 0)
   # 2) skip=$((skip_bytes / $ibs)) count=$((count_bytes / $ibs))
@@ -250,14 +259,24 @@ _errecho "final iflag=$__dd_iflag"
   __cmd=
   __cmd_end=
 
+  if [ $__dd_emu_seekbytes -eq 1 ]; then
+    __cmd='{ tail -c $((15/4=3)) $of | dd obs=$((15%4+1=4)) | dd ibs=$((15%4+1=4)) obs=$((15%4=3)) count=1; '
+    __cmd_end='; } | dd ibs=$bs obs=$bs seek=$((15/4=3)) of=$of'
+    unset __dd_of
+  fi
+
+
   if [ $__dd_emu_fullblock -eq 1 ]; then
       __dd_a=
+      __dd_in_conv=
       if [ -n "${__dd_conv:+set}" ]; then
-        # Remove conv= options that apply to the output blocks and file, then add them to a seperate list for second dd
-        for __dd_a in excl nocreat notrunc fdatasync fsync; do
-          _dd_listhas "$__dd_conv" $__dd_a || continue
-          __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
-          __dd_bufd_conv="$(_dd_listadd "${__dd_bufd_conv-}" $__dd_a)"
+        # Remove input conversions from list and add to a separate list
+        # NOTE: This list is safe to traverse unquoted as it's checked with _str_only above
+        for __dd_a in $(printf %s\\n "$__dd_conv" | tr , \\n); do
+          if ! _dd_listhas excl,nocreat,notrunc,fdatasync,fsync "$__dd_a"; then
+            __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
+            __dd_in_conv="$(_dd_listadd "${__dd_in_conv-}" $__dd_a)"
+          fi
         done
       fi
     # Write full (optionally converted) $ibs records from input
@@ -268,16 +287,15 @@ _errecho "final iflag=$__dd_iflag"
     __dd_emu_fullblock_ibs=$(($__dd_ibs / 2 ))
     [ $__dd_emu_fullblock_ibs -lt 1 ] && __dd_emu_fullblock_ibs=1
 
-    __cmd="dd status=none ibs=${__dd_emu_fullblock_ibs}${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"}"
-    __cmd="${__cmd}${__dd_if:+ if="$(_safe_dquoteval "$__dd_if")"}"
-    __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$(_safe_dquoteval "$__dd_conv")"}"
+    __cmd="${__cmd}dd status=none ibs=${__dd_emu_fullblock_ibs}${__dd_iflag:+ iflag="$(_safe_dqval "$__dd_iflag")"}"
+    __cmd="${__cmd}${__dd_if:+ if="$(_safe_dqval "$__dd_if")"}"
+    __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_in_conv:+ conv="$(_safe_dqval "$__dd_in_conv")"}"
     __cmd="${__cmd} obs=${__dd_ibs} | "
 
-    unset __dd_if
+    unset __dd_if __dd_cbs
 
   # Can we unset __dd_iflag __dd_if __dd_cbs __dd_conv now or do we need iflag for other parts?
   fi
-    __cmd="$__cmd"
 
   # skip_bytes emulation:
   # skip=14 ibs=4
@@ -294,7 +312,7 @@ _errecho "final iflag=$__dd_iflag"
   __cmd_skip=
   if [ $__dd_emu_skipbytes -eq 1 ]; then
     if [ $(($__dd_skip % $__dd_ibs)) -gt 0 ]; then
-      __cmd_skip="dd ibs=$(($__dd_skip % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"} skip=1 count=0; "
+      __cmd_skip="dd ibs=$(($__dd_skip % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dqval "$__dd_iflag")"} skip=1 count=0; "
     fi
     __dd_skip=$(($__dd_skip / $__dd_ibs))
   fi
@@ -303,27 +321,31 @@ _errecho "final iflag=$__dd_iflag"
   # $__dd_count is > 0 if $__dd_emu_countbytes is enabled
   if [ $__dd_emu_countbytes -eq 1 ]; then
     if [ $(($__dd_count % $__dd_ibs)) -gt 0 ]; then
-      __cmd_count="; dd ibs=$(($__dd_count % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"} skip=0 count=1"
-      __cmd_count="${__cmd_count}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_bufd_conv:+ conv="$(_safe_dquoteval "$__dd_bufd_conv")"}"
+      __cmd_count="; dd ibs=$(($__dd_count % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dqval "$__dd_iflag")"} skip=0 count=1"
+      __cmd_count="${__cmd_count}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$(_safe_dqval "$__dd_conv")"}"
     fi
     __dd_count=$(($__dd_count / $__dd_ibs))
   fi
 
   if [ -n "$__cmd_skip$__cmd_count" ]; then
     __cmd="${__cmd}{ "
-    __cmd_end="; }${__dd_if:+ <"$(_safe_dquoteval "$__dd_if")"} | output dd"
-    unset __dd_if # Previously potentially unset by fullblock emu
+    __cmd_end="; }${__dd_if:+ <"$(_safe_dqval "$__dd_if")"}${__dd_of:+ >"$(_safe_dqval "$__dd_of")"}${__cmd_end}"
+    unset __dd_if __dd_of
   fi
 
 # { dd bs=1 iflag=fullblock,count_bytes oflag=seek_bytes skip=0 count=1 seek=400; dd bs=1 iflag=fullblock,count_bytes oflag=seek_bytes skip=0 count=1 seek=200; } </dev/zero >test
 # WORKS!
 
+# TODO SIMPLIFY SEEK USING ABOVE METHOD! WE DON'T NEED TO TAIL FILE AND DO THAT COMPLICATED MESS
+# WE MIGHT NOT EVEN NEED THE SECOND LEVEL OF BRACES OR MORE DDs!
+
+
   # Write to output
-  __cmd="${__cmd}${__cmd_skip}dd ibs=${__dd_ibs}${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"}"
-  __cmd="${__cmd}${__dd_if:+ if="$(_safe_dquoteval "$__dd_if")"}"
-  __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_bufd_conv:+ conv="$(_safe_dquoteval "$__dd_bufd_conv")"}"
+  __cmd="${__cmd}${__cmd_skip}dd ibs=${__dd_ibs}${__dd_iflag:+ iflag="$(_safe_dqval "$__dd_iflag")"}"
+  __cmd="${__cmd}${__dd_if:+ if="$(_safe_dqval "$__dd_if")"}"
   __cmd="${__cmd}${__dd_skip:+ skip="$__dd_skip"}${__dd_count:+ count="$__dd_count"}${__dd_seek:+ seek="$__dd_seek"}"
-  __cmd="${__cmd} obs=${__dd_obs}${__dd_oflag:+ oflag="$(_safe_dquoteval "$__dd_oflag")"}${__dd_of:+ of="$(_safe_dquoteval "$__dd_of")"}"
+  __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$(_safe_dqval "$__dd_conv")"}"
+  __cmd="${__cmd} obs=${__dd_obs}${__dd_oflag:+ oflag="$(_safe_dqval "$__dd_oflag")"}${__dd_of:+ of="$(_safe_dqval "$__dd_of")"}"
 
   __cmd="${__cmd}${__cmd_count}${__cmd_end}"
 
