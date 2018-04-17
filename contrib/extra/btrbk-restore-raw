@@ -21,8 +21,9 @@ KiB=1024; MiB=$((1024 * KiB)); GiB=$((1024 * MiB)); TiB=$((1024 * GiB)); PiB=$((
 # SI byte multiple constants
  KB=1000;  MB=$((1000 * KB));   GB=$((1000 * MB));   TB=$((1000 * GB));   PB=$((1000 * TB))
 
-# Determine if a string is parseable as an signed integer
+# Determine if a string is parseable as a signed integer
 _test_parse_int() { ( [ $((${1#+} + 0)) = "${1#+}" ] ) 2>/dev/null; }
+
 # Determine maximum number value and set INTMAX constant
 # POSIX specifies only signed long C ints for arithmetic expansion $(())
 if _test_parse_int '9223372036854775807'; then
@@ -68,11 +69,12 @@ _trap() { __trap_cb="$1"; shift; for __trap_s in "$@" ; do trap "$__trap_cb $__t
 
 # "_safe_dquoteval $value" - prepends backslash, backtick/backquote, dollar-sign, and double-quote in $value with \ and wraps the result in double-quotes for use in eval'd double-quoted strings, ex: eval "echo $(_safe_dquoteval "\$(date)")"
 # WARNING: Do NOT wrap the output of this function in escaped double-quotes at the call site! WRONG: eval "echo \"$(_safe_dquoteval "\$(date)")\""
-_safe_dquoteval() {  printf '"'; printf '%s' "$1" | sed 's/[\\`$"]/\\&/g'; printf '"'; }
+# NOTE: != 0 is intentional to ensure string comparison
+_safe_dquoteval() { [ "${2-1}" = 0 ]||printf \"; printf %s "$1" | sed 's/[\\`$"]/\\&/g'; [ "${2-1}" = 0 ]||printf \"; }
 
 # "_safe_eval_setvar $name $value" - validates $name and sanitizes $value using _safe_dquoteval before setting the variable using eval
 _safe_eval_setvar() {
-  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "${1}=$(_safe_dquoteval "$2")"; }
+  { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "$1=$(_safe_dquoteval "$2")"; }
 
 # "_require_bin $command [$pkgname]" - enforces the existence of an executable name in $PATH, var prefix: "__reqbin_", ex: _require_bin btrfs btrfs-progs
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
@@ -109,12 +111,13 @@ _load_info_file() {
   } < "$1"; unset __ldinfo_k __ldinfo_v
 }
 
-#DD_BLOCKFACTOR=32 let user specify as we enforce the middle buffer later
-_dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} {if($1!=""&&!seen[$1]++){ORS=y;print s;y=";";s=$1}} END{ORS="";print s}'; }
-_dd_listadd() { printf '%s%s' "${1:+"${1},"}" "$2"; }
-_dd_listrem() { __ddlrem_a="${1#*"${2}"},${1%"${2}"*}"; __ddlrem_a="${__ddlrem_a##,}"; printf '%s' "${__ddlrem_a%%,}"; unset __ddlrem_a; }
+# Outputs a normalized version of a list ("a,f,b,,,c,d,,b,,e,f" => "a,f,b,c,d,e")
+_dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} {if($1!=""&&!seen[$1]++){ORS=y;print s;y=",";s=$1}} END{ORS="";print s}'; }
+_dd_listadd() { _dd_listhas "$1" "$2" && printf '%s' "$1" || printf '%s%s' "${1:+"${1},"}" "$2"; }
+# WARNING: List must be normalized (`list="$(_dd_listnorm "$list")"`) before using _dd_listrem! (Subshell for brevity)
+_dd_listrem() { ! _dd_listhas "$1" "$2" && printf '%s' "$1" || ( a="${1#*"${2}"},${1%"${2}"*}"; a="${a##,}"; printf '%s' "${a%%,}" ); }
 # Like performing _str_contains but checks comma boundaries to ensure that the search value isn't a substring of another value
-_dd_listhas() { [ -n "$1" ] && [ -n "$2" ] && { [ "$1" = "$2" ] || [ -z "${1##*"${2},"*}" ] || [ -z "${1##*"${2},"*}" ]; }; }
+_dd_listhas() { [ -n "$1" ] && [ -n "$2" ] && { [ "$1" = "$2" ] || [ -z "${1##*"${2},"*}" ] || [ -z "${1##*",${2}"*}" ]; }; }
 _dd() {
   # dd always outputs full obs blocks (it will block until it can do so), thus we should leverage that
   # to determine the amount of bytes read by dd's status output of records (we NEVER want a partial!)
@@ -123,7 +126,12 @@ _dd() {
   # * if dd doesn't support fullblock we need to synchronize the input of the main dd (dd obs=$size | dd bs=$size ...)
   #  See: https://unix.stackexchange.com/questions/32988/why-does-dd-from-dev-random-give-different-file-sizes/192092#192092
 
+  # NOTE: iflag=fullblock is automatically enabled if count= and/or skip= are used
+
   # Default input and output block size values (POSIX >= 512, Linux = >=4096)
+
+  # set -x # TODO REMOVE ==========================================================================
+
   __dd_ibs=4096
   __dd_obs=4096
 
@@ -146,45 +154,58 @@ _dd() {
       iflag=*) __dd_iflag="$(_dd_listadd "${__dd_iflag-}" "${__dd_a#iflag=}")" ;;
       oflag=*) __dd_oflag="$(_dd_listadd "${__dd_oflag-}" "${__dd_a#oflag=}")" ;;
       status=*) _ERR "Setting status= value is not supported (use pv instead)" ;;
-      *) _ERR "Unsupported dd parameter: $__dd_a"
+      *) _ERR "Unsupported dd operand: $__dd_a"
     esac
   done
 
   # Validate size options (NOTE: all must be byte|count values, no suffixes!)
-  [ -n "${__dd_ibs:+isset}" ]   && _test_parse_int "$__dd_ibs"
-  [ -n "${__dd_obs:+isset}" ]   && _test_parse_int "$__dd_obs"
-  [ -n "${__dd_bs:+isset}" ]    && _test_parse_int "$__dd_bs"
-  [ -n "${__dd_count:+isset}" ] && _test_parse_int "$__dd_count"
-  [ -n "${__dd_skip:+isset}" ]  && _test_parse_int "$__dd_skip"
-  [ -n "${__dd_seek:+isset}" ]  && _test_parse_int "$__dd_seek"
+  if [ -n "${__dd_ibs:+set}" ]; then _test_parse_int "$__dd_ibs" || _ERR "Invalid ibs value: $__dd_ibs"; fi
+  if [ -n "${__dd_obs:+set}" ]; then _test_parse_int "$__dd_obs" || _ERR "Invalid obs value: $__dd_obs"; fi
+  if [ -n "${__dd_bs:+set}" ]; then
+    _test_parse_int "$__dd_bs" || _ERR "Invalid bs value: $__dd_bs"
+    __dd_ibs=$__dd_bs # Are we sure we want to override these here?
+    __dd_obs=$__dd_bs # Probably, because then we can be explicit
+  fi
+  if [ -n "${__dd_count:+set}" ]; then
+    _test_parse_int "$__dd_count" || _ERR "Invalid count value: $__dd_count"
+    __dd_iflag="$(_dd_listadd "${__dd_iflag-}" fullblock)" # Force fullblock for count=
+  fi
+  if [ -n "${__dd_skip:+set}" ]; then
+    _test_parse_int "$__dd_skip" || _ERR "Invalid skip value: $__dd_skip"
+    __dd_iflag="$(_dd_listadd "${__dd_iflag-}" fullblock)" # Force fullblock for skip=
+  fi
+  if [ -n "${__dd_seek:+set}" ]; then _test_parse_int "$__dd_seek" || _ERR "Invalid seek value: $__dd_seek"; fi
+
   # Normalize list options (item[,...]) to remove duplicates and null items (,,[,...])
   if [ -n "${__dd_conv:+isset}" ]; then
      __dd_conv="$(_dd_listnorm "$__dd_conv")"
   fi
   if [ -n "${__dd_iflag:+isset}" ]; then
     __dd_iflag="$(_dd_listnorm "$__dd_iflag")"
-    if _dd_listhas "$__dd_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -ne 1 ]; then
-      __dd_emu_fullblock=1
+    if { _dd_listhas "$__dd_iflag" fullblock && [ $DD_IFLAG_FULLBLOCK -ne 1 ]; }; then
       __dd_iflag="$(_dd_listrem "$__dd_iflag" fullblock)"
+      __dd_emu_fullblock=1
     fi
-    if _dd_listhas "$__dd_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -ne 1 ]; then
-      __dd_emu_countbytes=1
+    if { _dd_listhas "$__dd_iflag" count_bytes && [ $DD_IFLAG_COUNTBYTES -ne 1 ]; }; then
       __dd_iflag="$(_dd_listrem "$__dd_iflag" count_bytes)"
+      # Only enable emulation if actually needed (count is set and > 0)
+      [ ${__dd_count:-0} -gt 0 ] && __dd_emu_countbytes=1
     fi
-    if _dd_listhas "$__dd_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -ne 1 ]; then
-      __dd_emu_skipbytes=1
+    if { _dd_listhas "$__dd_iflag" skip_bytes && [ $DD_IFLAG_SKIPBYTES -ne 1 ]; }; then
       __dd_iflag="$(_dd_listrem "$__dd_iflag" skip_bytes)"
+      # Only enable emulation if actually needed (skip is set and > 0)
+      [ ${__dd_skip:-0} -gt 0 ] && __dd_emu_skipbytes=1
     fi
   fi
   if [ -n "${__dd_oflag:+isset}" ]; then
      __dd_oflag="$(_dd_listnorm "$__dd_oflag")"
-    if _dd_listhas "$__dd_oflag" seek_bytes && [ $DD_OFLAG_SEEKBYTES -ne 1 ]; then
-      __dd_emu_seekbytes=1
+    if { _dd_listhas "$__dd_oflag" seek_bytes && [ $DD_OFLAG_SEEKBYTES -ne 1 ]; }; then
       __dd_oflag="$(_dd_listrem "$__dd_oflag" seek_bytes)"
+      # Only enable emulation if actually needed (seek is set and > 0)
+      [ ${__dd_seek:-0} -gt 0 ] && __dd_emu_seekbytes=1
     fi
   fi
-
-
+_errecho "final iflag=$__dd_iflag"
   # skip_bytes/count_bytes emulation
   # 1) skip=1 count=0 with ibs=$((skip_bytes % ibs)) (if > 0)
   # 2) skip=$((skip_bytes / $ibs)) count=$((count_bytes / $ibs))
@@ -204,21 +225,126 @@ _dd() {
   #
   # seek_bytes emulation:
   # seek=15 bs=4
-  #   seek to arbitrary pos     now read remainder before real input          real input        output (might should be a _dd call
-  #                             (this dd *might* read partial blocks!)                          (skip/count here)   to support fullbock)
-  # { tail -c $((15/4=3)) $of | dd ibs=$((15%4+1=4)) obs=$((15%4=3)) count=1; dd if=$if ... } | dd ibs=$bs obs=$bs seek=$((15/4=3)) of=$of
+  # { tail -c $((15/4=3)) $of                            # seek to arbitrary pos
+  #     | dd obs=$((15%4+1=4))                           # force fullbock if needed (no iflag=fullblock)
+  #     | dd ibs=$((15%4+1=4)) obs=$((15%4=3)) count=1   # now read remainder before real input
+  #   ; {fullblock |} dd if=$if ...                      # real input (skip/count here)
+  # } | dd ibs=$bs obs=$bs seek=$((15/4=3)) of=$of       # output
   #
+# FULLBLOCK EMU:
+#      { __dd_stats="$( [ $TRACE -eq 1 ] && set -x; \
+#          dd status=none ibs="$((${__dd_bs:-${__dd_ibs:-${__dd_def_bs}}} + 1))" obs="${__dd_bs:-${__dd_ibs:-${__dd_def_bs}}}" \
+#            ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
+#          | 2>&1 1>&3 dd ibs="${__dd_bs:-${__dd_ibs:-${__dd_def_bs}}}" obs="${__dd_bs:-${__dd_obs:-${__dd_def_bs}}}" \
+#            ${__dd_count:+count="$__dd_count"} ${__dd_skip:+skip="$__dd_skip"} ${__dd_seek:+seek="$__dd_seek"} \
+#            ${__dd_of:+of="$__dd_of"} ${__dd_oflag:+oflag="$__dd_oflag"} ${__dd_bufd_conv:+conv="$__dd_bufd_conv"} \
+#        )";
+#      } 3>&1
+
+  # When fullblock emulation is on we always have a primary source dd which gets if= and such
+  # Otherwise if= and such are set to each read dd with iflag=fullbock
+  #
+
+  # If no emulation is necessary at all we should use just one dd command
+
+  __cmd=
+  __cmd_end=
+
+  if [ $__dd_emu_fullblock -eq 1 ]; then
+      __dd_a=
+      if [ -n "${__dd_conv:+set}" ]; then
+        # Remove conv= options that apply to the output blocks and file, then add them to a seperate list for second dd
+        for __dd_a in excl nocreat notrunc fdatasync fsync; do
+          _dd_listhas "$__dd_conv" $__dd_a || continue
+          __dd_conv="$(_dd_listrem "$__dd_conv" $__dd_a)"
+          __dd_bufd_conv="$(_dd_listadd "${__dd_bufd_conv-}" $__dd_a)"
+        done
+      fi
+    # Write full (optionally converted) $ibs records from input
+    # This can be continued by a simple read with either count or skip
+    # If we need count_bytes or skip_bytes emulation we need to read from fullblock dd in braces
+
+    # TODO: Allow user to set this somehow
+    __dd_emu_fullblock_ibs=$(($__dd_ibs / 2 ))
+    [ $__dd_emu_fullblock_ibs -lt 1 ] && __dd_emu_fullblock_ibs=1
+
+    __cmd="dd status=none ibs=${__dd_emu_fullblock_ibs}${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"}"
+    __cmd="${__cmd}${__dd_if:+ if="$(_safe_dquoteval "$__dd_if")"}"
+    __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_conv:+ conv="$(_safe_dquoteval "$__dd_conv")"}"
+    __cmd="${__cmd} obs=${__dd_ibs} | "
+
+    unset __dd_if
+
+  # Can we unset __dd_iflag __dd_if __dd_cbs __dd_conv now or do we need iflag for other parts?
+  fi
+    __cmd="$__cmd"
+
   # skip_bytes emulation:
-  # skip=14 bs=4
-  # { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0; dd ibs=$bs obs=$bs skip=$((14/4=3)) } <$if
+  # skip=14 ibs=4
+  # {fullblock_dd |} { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0; dd ibs=$bs obs=$bs skip=$((14/4=3)) }
+  # count & skip
+  # {fullblock_dd |} { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0;
+  #   dd ibs=$bs obs=$bs skip=$((14/4=3)) count=$((17/4=4));
+  #   $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
+
+  # If skip_bytes|count_bytes and skip or count need more than one read we need another piped dd for output
+
+  # $__dd_skip is > 0 if $__dd_emu_skipbytes is enabled
+  # Skip remainder first
+  __cmd_skip=
+  if [ $__dd_emu_skipbytes -eq 1 ]; then
+    if [ $(($__dd_skip % $__dd_ibs)) -gt 0 ]; then
+      __cmd_skip="dd ibs=$(($__dd_skip % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"} skip=1 count=0; "
+    fi
+    __dd_skip=$(($__dd_skip / $__dd_ibs))
+  fi
+
+  __cmd_count=
+  # $__dd_count is > 0 if $__dd_emu_countbytes is enabled
+  if [ $__dd_emu_countbytes -eq 1 ]; then
+    if [ $(($__dd_count % $__dd_ibs)) -gt 0 ]; then
+      __cmd_count="; dd ibs=$(($__dd_count % $__dd_ibs))${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"} skip=0 count=1"
+      __cmd_count="${__cmd_count}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_bufd_conv:+ conv="$(_safe_dquoteval "$__dd_bufd_conv")"}"
+    fi
+    __dd_count=$(($__dd_count / $__dd_ibs))
+  fi
+
+  if [ -n "$__cmd_skip$__cmd_count" ]; then
+    __cmd="${__cmd}{ "
+    __cmd_end="; }${__dd_if:+ <"$(_safe_dquoteval "$__dd_if")"} | output dd"
+    unset __dd_if # Previously potentially unset by fullblock emu
+  fi
+
+# { dd bs=1 iflag=fullblock,count_bytes oflag=seek_bytes skip=0 count=1 seek=400; dd bs=1 iflag=fullblock,count_bytes oflag=seek_bytes skip=0 count=1 seek=200; } </dev/zero >test
+# WORKS!
+
+  # Write to output
+  __cmd="${__cmd}${__cmd_skip}dd ibs=${__dd_ibs}${__dd_iflag:+ iflag="$(_safe_dquoteval "$__dd_iflag")"}"
+  __cmd="${__cmd}${__dd_if:+ if="$(_safe_dquoteval "$__dd_if")"}"
+  __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_bufd_conv:+ conv="$(_safe_dquoteval "$__dd_bufd_conv")"}"
+  __cmd="${__cmd}${__dd_skip:+ skip="$__dd_skip"}${__dd_count:+ count="$__dd_count"}${__dd_seek:+ seek="$__dd_seek"}"
+  __cmd="${__cmd} obs=${__dd_obs}${__dd_oflag:+ oflag="$(_safe_dquoteval "$__dd_oflag")"}${__dd_of:+ of="$(_safe_dquoteval "$__dd_of")"}"
+
+  __cmd="${__cmd}${__cmd_count}${__cmd_end}"
+
+  # TODO Check if we had more than one command above and write trailing } here
+
+
+_errecho "$ $__cmd"
+exit
+#  fi
+
+  # skip_bytes emulation:
+  # skip=14 ibs=4
+  # {fullblock_dd |} { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0; dd ibs=$bs obs=$bs skip=$((14/4=3)) }
   #
   # count_bytes emulation
-  # count=17 bs=4
-  # { dd ibs=$bs obs=$bs count=$((17/4=4)); $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
+  # count=17 ibs=4
+  # {fullblock_dd |} { dd ibs=$bs obs=$bs count=$((17/4=4)); $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
   #
   # How to mix them?
   # count & skip
-  # { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0;
+  # {fullblock_dd |} { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0;
   #   dd ibs=$bs obs=$bs skip=$((14/4=3)) count=$((17/4=4));
   #   $((17%4>0)) && dd ibs=$((17%4=1)) count=1; } <$if
   #
@@ -230,7 +356,15 @@ _dd() {
   # 2) skip=$((skip_bytes / $ibs)) count=$((count_bytes / $ibs))
   # 3) skip=0 count=1 with ibs=$((count_bytes % ibs)) (if > 0)
 
-  if $(($__dd_emu_countbytes + $__dd_emu_skipbytes + $__dd_emu_seekbytes > 0)); then
+  # skip bytes emu
+  ___dd_cmd=
+  # {fullblock_dd |} { $((14%4>0)) && dd ibs=$((14%4=2)) skip=1 count=0; dd ibs=$bs obs=$bs skip=$((14/4=3)) } <$if
+  if [ $__dd_emu_skipbytes -eq 1 ]; then
+    #if [ $(($ibs / skip)) -eq 0...
+    __dd_incmd=
+  fi
+
+  if [ $(($__dd_emu_countbytes + $__dd_emu_skipbytes + $__dd_emu_seekbytes)) -gt 0 ]; then
     _errecho "WARNING: Emulating GNU dd iflag=(count|skip)_bytes/oflag=seek_bytes"
 
 
@@ -274,24 +408,28 @@ _dd() {
       _errecho ">>>$__dd_stats"
       exit
 
-      # TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
-      # resilient parsing as well as allowing for error checking
-      [ -n "$__dd_stats" ] || _ERR 'Failed to parse dd status output'
-      __dd_stats_in="${__dd_stats%% records in"$NL"*}"
-      __dd_stats_out="${__dd_stats##"${__dd_stats%%"$NL"*}$NL"}"
-      __dd_stats_out="${__dd_stats_out% records out}"
-      [ ${#__dd_stats_in} -eq 3 ]  && [ -z "${__dd_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
-      [ ${#__dd_stats_out} -eq 3 ] && [ -z "${__dd_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
-      __dd_stats_out_whole="${__dd_stats_out%+*}"
-      __dd_stats_out_partial="${__dd_stats_out#*+}"
-      __dd_stats_in_whole="${__dd_stats_out%+*}"
-      __dd_stats_in_partial="${__dd_stats_in#*+}"
-      _errecho "IN:  $(($__dd_stats_in_whole * $__dd_bs)) + (${__dd_stats_in_partial} * ?)"
-      _errecho "OUT: $(($__dd_stats_out_whole * $__dd_bs)) + (${__dd_stats_out_partial} * ?)"
+      ## TODO Get all of stderr from dd (remove grep) and case through each line with globs, this would make for more
+      ## resilient parsing as well as allowing for error checking
+      #[ -n "$__dd_stats" ] || _ERR 'Failed to parse dd status output'
+      #__dd_stats_in="${__dd_stats%% records in"$NL"*}"
+      #__dd_stats_out="${__dd_stats##"${__dd_stats%%"$NL"*}$NL"}"
+      #__dd_stats_out="${__dd_stats_out% records out}"
+      #[ ${#__dd_stats_in} -eq 3 ]  && [ -z "${__dd_stats_in#?+?}" ]  || _ERR 'Failed to parse dd records in'
+      #[ ${#__dd_stats_out} -eq 3 ] && [ -z "${__dd_stats_out#?+?}" ] || _ERR 'Failed to parse dd records out'
+      #__dd_stats_out_whole="${__dd_stats_out%+*}"
+      #__dd_stats_out_partial="${__dd_stats_out#*+}"
+      #__dd_stats_in_whole="${__dd_stats_out%+*}"
+      #__dd_stats_in_partial="${__dd_stats_in#*+}"
+      #_errecho "IN:  $(($__dd_stats_in_whole * $__dd_bs)) + (${__dd_stats_in_partial} * ?)"
+      #_errecho "OUT: $(($__dd_stats_out_whole * $__dd_bs)) + (${__dd_stats_out_partial} * ?)"
+
+
       break # TODO REMOVE --------------------------------********************************************
+   fi
+
     done
   else
-    { __dd_stats="$( [ $TRACE -eq 1 ] && set -x; \
+    { __dd_stats="$( [ $TRACE -eq 0 ] && set -x; \
         2>&1 1>&3 dd ${__dd_bs:+bs="$__dd_bs"} ${__dd_cbs:+cbs="$__dd_cbs"} ${__dd_conv:+conv="$__dd_conv"} \
           ${__dd_count:+count="$__dd_count"} ${__dd_skip:+skip="$__dd_skip"} ${__dd_seek:+seek="$__dd_seek"} \
           ${__dd_ibs:+ibs="$__dd_ibs"} ${__dd_if:+if="$__dd_if"} ${__dd_iflag:+iflag="$__dd_iflag"} \
@@ -488,13 +626,15 @@ _MAIN() {
 
     # TODO Feature-test findmnt
   fi
-
 total=$((1024 * 1024 * 1024 + 124283))
 #dd status=none ibs=3 obs=7 if=/dev/random
-set +x
 DD_BLOCKFACTOR=1
-DD_IFLAG_FULLBLOCK=0
-_dd if=/dev/random iflag=fullblock bs=$((1 * KiB)) count=2 | pv -bn >/dev/null
+# Full emu
+DD_IFLAG_FULLBLOCK=${FULLBLK:-1}
+DD_IFLAG_SKIPBYTES=${SKIP:-1}
+DD_IFLAG_COUNTBYTES=${COUNT:-1}
+DD_OFLAG_SEEKBYTES=${SEEK:-1}
+_dd "$@" | pv -bn >/dev/null
 exit
 
   # Script arguments
