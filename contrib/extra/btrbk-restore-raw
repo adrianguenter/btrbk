@@ -252,11 +252,12 @@ _dd() {
       __dd_fblk_stderr="${TMPDIR:?Temp directory not set}/dd-fblk.stderr"
       mkfifo -m 0600 "$__dd_fblk_stdout" "$__dd_fblk_stderr"
       __cmd="${__cmd} of=$(_safe_dqval "$__dd_fblk_stdout") 2>$(_safe_dqval "$__dd_fblk_stderr") & fblkpid=\$!; "
+      __dd_if="$__dd_fblk_stdout"
     else
       __cmd="${__cmd} obs=${__dd_ibs} | "
+      unset __dd_if
     fi
-    # TODO Either add | or write to fifo
-    unset __dd_if __dd_cbs
+    unset __dd_cbs
   fi
   # $__dd_seek is > 0 if $__dd_emu_seekbytes is enabled
   # Seek remainder
@@ -315,9 +316,11 @@ _dd() {
   _errecho "$ $__cmd"
 
   set +e
-  for _ in i; do
+  for _ in DO_ONCE; do # Provide a structure the eval'd block can "break" from on error
     _errecho eval "$__cmd"; result=$?
-    [ -n "${ERRCHK+set}" ] || exit $result
+    # TODO kill or whatever
+    ps -lp $fblkpid | awk 'END{if(NR>1){print $2}}'
+    [ -n "${ERRCHK+set}" ] || exit $result # Skip error check and just return result
   done
 
   _errecho "SKIP${NL}----${NL}$skip"
