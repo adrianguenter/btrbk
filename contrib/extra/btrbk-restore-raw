@@ -1,8 +1,6 @@
 #!/usr/bin/dash
 # TODO: ^^^^^^^ Revert to /bin/sh
 
-export POSIXLY_CORRECT=1
-
 set -eu # exit on error, error on unset
 [ "${TRACE:=0}" -eq 1 ] && set -x # TRACE=1 btrbk-restore-raw ...
 
@@ -79,6 +77,12 @@ _safe_dqval() { [ "${2-}" != QUOTE_ALWAYS ] && set "$1" 'f="%s";if(s~/[[:space:]
 _safe_eval_setvar() {
   { printf '%s' "$1" | grep -q '[^A-Za-z0-9_]'; } && return 1; eval "$1=$(_safe_dquoteval "$2")"; }
 
+# Portable mktemp/mktemp -d; tries to use "$TMPDIR", then "/tmp", then "." or returns 1
+_tempname() ( for _ in "${TMPDIR-}" /tmp .; do [ -d "$_" ] && [ -w "$_" ] && { dir="$_"; break; }; done; [ -z ${dir+set} ] && return 1;
+  while :; do path="${dir}/${1-"tmp."}$(od -An -N5 -tx1 /dev/urandom | tr -d ' ')"; [ -e "$path" ] || break; done; printf %s "$path"; )
+_mktemp() ( path="$(_tempname ${1+"$1"})"; umask 0177 && touch "$path" || return 1; printf %s "$path"; )
+_mktempd() ( path="$(_tempname ${1+"$1"})"; mkdir -m 0700 "$path" || return 1; printf %s "$path"; )
+
 # "_require_bin $command [$pkgname]" - enforces the existence of an executable name in $PATH, var prefix: "__reqbin_", ex: _require_bin btrfs btrfs-progs
 _require_bin() { __reqbin_p="$(command -v "$1" ||:)"
   # Ensure that $__reqbin_p is both absolute (starts with "/") and also ends in "/<command_name>" ("/binfile" matches)
@@ -113,15 +117,6 @@ _load_info_file() {
     done
   } < "$1"; unset __ldinfo_k __ldinfo_v
 }
-
-# Portable mktemp -u; tries to use "$TMPDIR", then "/tmp", then "." or returns 1
-_tempname() (
-  for _ in "${TMPDIR-}" /tmp .; do [ -d "$_" ] && [ -w "$_" ] && { dir="$_"; break; }; done; [ -z ${dir+set} ] && return 1
-  while :; do path="${dir}/${1-"tmp."}$(od -An -N5 -tx1 /dev/urandom | tr -d ' ')"; [ -e "$path" ] || break; done
-  printf %s "$path"
-)
-_mktemp() ( path="$(_tempname ${1+"$1"})"; umask 0177 && touch "$path" || return 1; printf %s "$path"; )
-_mktempd() ( path="$(_tempname ${1+"$1"})"; mkdir -m 0700 "$path" || return 1; printf %s "$path"; )
 
 # Outputs a normalized version of a list ("a,f,b,,,c,d,,b,,e,f" => "a,f,b,c,d,e")
 _dd_listnorm() { printf '%s' "$1" | awk 'BEGIN{RS=ORS=","} {if($1!=""&&!seen[$1]++){ORS=y;print s;y=",";s=$1}} END{ORS="";print s}'; }
@@ -241,13 +236,26 @@ _dd() {
         fi
       done
     fi
+    # I think we need two fifos since we either need a pipe or to background the reader
+    # One to pass data the other to pass stderr. If we use a pipe both sides will be subshelled
+
     # TODO: Allow user to specify this value (add a dedicated operand? unbufd_ibs= or similar?)
     __dd_emu_unbufd_ibs=$(($__dd_ibs / 2 ))
     [ $__dd_emu_unbufd_ibs -lt 1 ] && __dd_emu_unbufd_ibs=1
     __cmd="${__cmd}dd status=none ibs=${__dd_emu_unbufd_ibs}${__dd_iflag:+ iflag="$__dd_iflag"}"
     __cmd="${__cmd}${__dd_if:+ if="$__dd_if"}"
     __cmd="${__cmd}${__dd_cbs:+ cbs="$__dd_cbs"}${__dd_in_conv:+ conv="$__dd_in_conv"}"
-    __cmd="${__cmd} obs=${__dd_ibs} | "
+
+
+    if [ -n "${ERRCHK+set}" ]; then
+      __dd_fblk_stdout="${TMPDIR:?Temp directory not set}/dd-fblk.stdout"
+      __dd_fblk_stderr="${TMPDIR:?Temp directory not set}/dd-fblk.stderr"
+      mkfifo -m 0600 "$__dd_fblk_stdout" "$__dd_fblk_stderr"
+      __cmd="${__cmd} of=$(_safe_dqval "$__dd_fblk_stdout") 2>$(_safe_dqval "$__dd_fblk_stderr") & fblkpid=\$!; "
+    else
+      __cmd="${__cmd} obs=${__dd_ibs} | "
+    fi
+    # TODO Either add | or write to fifo
     unset __dd_if __dd_cbs
   fi
   # $__dd_seek is > 0 if $__dd_emu_seekbytes is enabled
@@ -291,7 +299,7 @@ _dd() {
   fi
   if [ -n "${TEST+set}" ];then
   __test_cmd="${ERRCHK+"test=\"\$(2>&1 >/dev/null "}dd${__dd_iflag:+ iflag="$__dd_iflag"} skip=0 count=0 seek=0"
-  __test_cmd="${__test_cmd}${__dd_conv:+ conv="$__dd_conv"}${__dd_oflag:+ oflag="$__dd_oflag"}${ERRCHK+")\""} "
+  __test_cmd="${__test_cmd}${__dd_conv:+ conv="$__dd_conv"}${__dd_oflag:+ oflag="$__dd_oflag"}${ERRCHK+")\"; testexit=\$?"}"
   __cmd="${__test_cmd} && ${__cmd}"
   fi
 
