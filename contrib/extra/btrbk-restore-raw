@@ -220,6 +220,7 @@ _dd() {
   # they're checked with _str_only above
   ERRCHK=1
   TEST=1
+
   #__cmd="dd skip=0 count=0 seek=0${__dd_conv:+ conv="$__dd_conv"}; "
   __cmd=
   __cmd_end=
@@ -298,9 +299,10 @@ _dd() {
     __cmd_end="; }${__dd_if:+ <"$__dd_if"}${__dd_of:+ >"$__dd_of"}${ERRCHK+" 3>&1"}${__cmd_end}"
     unset __dd_if __dd_of
   fi
+  [ $TEST -eq 1 ] && TESTLAST='exit=$?; [ $exit -eq 0 ]'
   if [ -n "${TEST+set}" ];then
   __test_cmd="${ERRCHK+"test=\"\$(2>&1 >/dev/null "}dd${__dd_iflag:+ iflag="$__dd_iflag"} skip=0 count=0 seek=0"
-  __test_cmd="${__test_cmd}${__dd_conv:+ conv="$__dd_conv"}${__dd_oflag:+ oflag="$__dd_oflag"}${ERRCHK+")\"; testexit=\$?"}"
+  __test_cmd="${__test_cmd}${__dd_conv:+ conv="$__dd_conv"}${__dd_oflag:+ oflag="$__dd_oflag"}${ERRCHK+")\"; test${TESTLAST}"}"
   __cmd="${__test_cmd} && ${__cmd}"
   fi
 
@@ -315,13 +317,15 @@ _dd() {
 
   _errecho "$ $__cmd"
 
-  set +e
-  for _ in DO_ONCE; do # Provide a structure the eval'd block can "break" from on error
+  for _ in DO_ONCE; do # TODO: REMOVE IF UNUSED -- Provide a structure the eval'd block can "break" from on error
     _errecho eval "$__cmd"; result=$?
-    # TODO kill or whatever
-    ps -lp $fblkpid | awk 'END{if(NR>1){print $2}}'
     [ -n "${ERRCHK+set}" ] || exit $result # Skip error check and just return result
   done
+exit
+    # TODO kill or whatever
+
+  [ -n "${fblkpid+set}" ] && ps -lp $fblkpid | awk 'END{if(NR>1){print "FULLBLOCK STATE: "$2}}'
+  #[ -n "${fblk+set}" ] && ;;
 
   _errecho "SKIP${NL}----${NL}$skip"
   _errecho "MAIN${NL}----${NL}$main"
